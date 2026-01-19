@@ -24,6 +24,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from materials import TYPE_CHART
 from pokedex_9G_complete import pokemon_data_gen9
 
 
@@ -53,11 +54,43 @@ STATUS_LIST = ["none", "brn", "par", "slp", "frz", "psn", "tox"]
 WEATHER_LIST = ["none", "sunnyday", "raindance", "sandstorm", "hail", "snow"]
 TERRAIN_LIST = ["none", "electricterrain", "grassyterrain", "mistyterrain", "psychicterrain"]
 
-BOOST_KEYS = ["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]
+ACTIVE_BOOST_KEYS = ["atk", "def", "spa", "spd", "spe"]
 
 MAX_TEAM_SIZE = 6
 TOTAL_POKEMON = MAX_TEAM_SIZE * 2
 
+TYPE_NAME_MAP = {key.lower(): key for key in TYPE_CHART}
+SPECIES_ALIASES = {
+    "sinistchamasterpiece": "sinistcha",
+    "sinistchaunremarkable": "sinistcha",
+    "polteageistantique": "polteageist",
+    "polteageistphony": "polteageist",
+    "gastrodoneast": "gastrodon",
+    "gastrodonwest": "gastrodon",
+    "pikachuoriginal": "pikachu",
+    "dudunsparcethreesegment": "dudunsparce",
+    "dudunsparcetwosegment": "dudunsparce",
+    "alcremiematchacream": "alcremie",
+    "mimikyubusted": "mimikyu",
+    "zarudedada": "zarude",
+    "toxtricitylowkey": "toxtricity",
+    "mausholdfour": "maushold",
+    "mausholdthree": "maushold",
+    "mausholdfamilyoffour": "maushold",
+    "mausholdfamilyofthree": "maushold",
+    "miniorblue": "minior",
+    "miniorgreen": "minior",
+    "miniorindigo": "minior",
+    "miniororange": "minior",
+    "minioryellow": "minior",
+    "miniorviolet": "minior",
+    "miniorred": "minior",
+    "miniorcore": "minior",
+    "ogerpontealtera": "ogerpon",
+    "ogerponwellspringtera": "ogerponwellspring",
+    "ogerponhearthflametera": "ogerponhearthflame",
+    "ogerponcornerstonetera": "ogerponcornerstone",
+}
 
 def normalize_species_name(name: str) -> str:
     if not name:
@@ -86,6 +119,63 @@ def hash_tokens(tokens: Iterable[str], dim: int) -> np.ndarray:
         vec[idx] += 1.0
     return vec
 
+
+def normalize_type_name(type_name: str) -> Optional[str]:
+    if not type_name:
+        return None
+    return TYPE_NAME_MAP.get(type_name.strip().lower())
+
+
+def canonicalize_species_norm(norm: str) -> str:
+    if not norm:
+        return norm
+    base = norm
+    if base.endswith("tera"):
+        base = base[:-4]
+    if base in SPECIES_ALIASES:
+        return SPECIES_ALIASES[base]
+    for prefix, target in (
+        ("pikachu", "pikachu"),
+        ("alcremie", "alcremie"),
+        ("minior", "minior"),
+        ("gastrodon", "gastrodon"),
+        ("mimikyu", "mimikyu"),
+        ("zarude", "zarude"),
+        ("toxtricity", "toxtricity"),
+        ("dudunsparce", "dudunsparce"),
+        ("polteageist", "polteageist"),
+        ("sinistcha", "sinistcha"),
+        ("maushold", "maushold"),
+    ):
+        if base != target and base.startswith(prefix):
+            return target
+    return base
+
+
+def type_multiplier(attacker_type: str, defender_types: List[str]) -> float:
+    atk = normalize_type_name(attacker_type)
+    if not atk or not defender_types:
+        return 1.0
+    chart = TYPE_CHART.get(atk, {})
+    mult = 1.0
+    for defender in defender_types:
+        def_name = normalize_type_name(defender)
+        if not def_name:
+            continue
+        mult *= chart.get(def_name, 1.0)
+    return mult
+
+
+def best_type_multiplier(attacker_types: List[str], defender_types: List[str]) -> float:
+    if not attacker_types or not defender_types:
+        return 1.0
+    return max(type_multiplier(t, defender_types) for t in attacker_types)
+
+
+def speed_multiplier(boost: int) -> float:
+    if boost >= 0:
+        return (2 + boost) / 2
+    return 2 / (2 - boost)
 
 def build_species_index() -> Tuple[Dict[str, str], Dict[str, int]]:
     norm_to_key: Dict[str, str] = {}
@@ -149,22 +239,34 @@ class FeatureBuilder:
         self.terrain_to_id = {name: idx for idx, name in enumerate(TERRAIN_LIST)}
         self.numeric_dim = self._numeric_dim()
         self.global_dim = self._global_dim()
+        self._warned_species: set[str] = set()
 
     def _numeric_dim(self) -> int:
         base = 0
         base += 4  # hp, fainted, revealed, is_active
-        base += len(BOOST_KEYS)
         base += 6  # base stats
         base += 1  # weight
-        base += 1  # fully evolved
         base += 1  # volatile count
         base += self.config.volatile_hash_dim
         base += 1  # has_substitute
         return base
 
-    def _global_dim(self) -> int:
-        return (self.config.side_hash_dim * 2) + (self.config.move_hash_dim * 2) + 7
+    def _base_global_dim(self) -> int:
+        return 7
 
+    def _matchup_dim(self) -> int:
+        base = 11
+        base += len(ACTIVE_BOOST_KEYS) * 2
+        return base
+
+    def _global_dim(self) -> int:
+        return (
+            (self.config.side_hash_dim * 2)
+            + (self.config.move_hash_dim * 2)
+            + self._base_global_dim()
+            + self._matchup_dim()
+        )
+    
     def _team_order(self, team: Dict[str, dict], active: Optional[str]) -> List[str]:
         names = list(team.keys())
         ordered: List[str] = []
@@ -179,6 +281,12 @@ class FeatureBuilder:
         norm = normalize_species_name(species)
         key = self.norm_to_key.get(norm)
         if not key:
+            alt = canonicalize_species_norm(norm)
+            if alt != norm:
+                key = self.norm_to_key.get(alt)
+        if not key:
+            if species not in self._warned_species:
+                self._warned_species.add(species)
             return None
         return pokemon_data_gen9.get(key)
 
@@ -186,6 +294,12 @@ class FeatureBuilder:
         norm = normalize_species_name(species)
         key = self.norm_to_key.get(norm)
         if not key:
+            alt = canonicalize_species_norm(norm)
+            if alt != norm:
+                key = self.norm_to_key.get(alt)
+        if not key:
+            if species not in self._warned_species:
+                self._warned_species.add(species)
             return 0
         return self.species_to_id.get(key, 0)
 
@@ -212,9 +326,9 @@ class FeatureBuilder:
             stats.get("Speed", 0) / 255.0,
         ]
 
-    def _boosts(self, boosts: Dict[str, int]) -> List[float]:
+    def _active_boosts(self, boosts: Dict[str, int]) -> List[float]:
         values: List[float] = []
-        for key in BOOST_KEYS:
+        for key in ACTIVE_BOOST_KEYS:
             raw = int(boosts.get(key, 0)) if boosts else 0
             clipped = max(min(raw, 6), -6)
             values.append(clipped / 6.0)
@@ -231,6 +345,48 @@ class FeatureBuilder:
         has_substitute = 1.0 if any("substitute" in t for t in tokens) else 0.0
         return volatile_count, hashed, has_substitute
 
+    def _find_team_member(self, team: Dict[str, dict], active_name: Optional[str]) -> Tuple[str, dict]:
+        if not active_name or not team:
+            return "", {}
+        if active_name in team:
+            return active_name, team[active_name]
+        active_norm = normalize_species_name(active_name)
+        for name, info in team.items():
+            if normalize_species_name(name) == active_norm:
+                return name, info
+        return active_name, team.get(active_name, {})
+
+    def _estimated_speed(self, entry: Optional[dict], boosts: Dict[str, int]) -> float:
+        if not entry:
+            return 0.0
+        base_speed = entry.get("stats", {}).get("Speed", 0)
+        boost = int(boosts.get("spe", 0)) if boosts else 0
+        return base_speed * speed_multiplier(boost)
+
+    def _team_matchup_ratios(self, team: Dict[str, dict], opp_types: List[str]) -> Tuple[float, float]:
+        if not team or not opp_types:
+            return 0.0, 0.0
+        resist = 0
+        weak = 0
+        count = 0
+        for name, info in team.items():
+            species = info.get("species") or name
+            entry = self._pokedex_entry(species)
+            if not entry:
+                continue
+            member_types = entry.get("types", [])
+            if not member_types:
+                continue
+            mult = best_type_multiplier(opp_types, member_types)
+            if mult >= 2.0:
+                weak += 1
+            elif mult <= 0.5:
+                resist += 1
+            count += 1
+        if count == 0:
+            return 0.0, 0.0
+        return resist / count, weak / count
+
     def build_example(self, example: dict) -> Optional[Tuple[Dict[str, np.ndarray], np.ndarray]]:
         state = example.get("state")
         if not state:
@@ -240,6 +396,13 @@ class FeatureBuilder:
         opp_team = state.get("opponent_team", {})
         our_active = state.get("our_active")
         opp_active = state.get("opponent_active")
+        our_active_name, our_active_info = self._find_team_member(our_team, our_active)
+        opp_active_name, opp_active_info = self._find_team_member(opp_team, opp_active)
+
+        our_active_entry = self._pokedex_entry(our_active_info.get("species") or our_active_name)
+        opp_active_entry = self._pokedex_entry(opp_active_info.get("species") or opp_active_name)
+        our_active_types = our_active_entry.get("types", []) if our_active_entry else []
+        opp_active_types = opp_active_entry.get("types", []) if opp_active_entry else []
 
         species_ids: List[int] = []
         type1_ids: List[int] = []
@@ -262,18 +425,14 @@ class FeatureBuilder:
                 fainted = 1.0 if info.get("fainted") else 0.0
                 revealed = 1.0 if info.get("revealed") else 0.0
                 is_active = 1.0 if name and active and name == active else 0.0
-                boosts = self._boosts(info.get("boosts", {}))
                 base_stats = self._base_stats(entry)
                 weight = (entry.get("weight", 0.0) / 1000.0) if entry else 0.0
-                fully_evolved = 1.0 if entry and entry.get("fully_evolved") else 0.0
                 volatile_count, volatile_h, has_sub = self._volatile_features(info.get("volatiles", []))
 
                 numeric_row: List[float] = []
                 numeric_row.extend([hp, fainted, revealed, is_active])
-                numeric_row.extend(boosts)
                 numeric_row.extend(base_stats)
                 numeric_row.append(weight)
-                numeric_row.append(fully_evolved)
                 numeric_row.append(volatile_count)
                 numeric_row.extend(volatile_h.tolist())
                 numeric_row.append(has_sub)
@@ -327,6 +486,28 @@ class FeatureBuilder:
         our_hp, our_fainted, our_revealed = aggregate(our_team)
         opp_hp, opp_fainted, opp_revealed = aggregate(opp_team)
 
+        our_active_hp = float(our_active_info.get("hp_percent", 0.0)) if our_active_info else 0.0
+        opp_active_hp = float(opp_active_info.get("hp_percent", 0.0)) if opp_active_info else 0.0
+        active_hp_diff = our_active_hp - opp_active_hp
+
+        our_speed = self._estimated_speed(our_active_entry, our_active_info.get("boosts", {}))
+        opp_speed = self._estimated_speed(opp_active_entry, opp_active_info.get("boosts", {}))
+        speed_diff = (our_speed - opp_speed) / 400.0
+        speed_diff = max(min(speed_diff, 1.0), -1.0)
+        if our_speed == 0.0 or opp_speed == 0.0:
+            speed_adv = 0.5
+        else:
+            speed_adv = 1.0 if our_speed >= opp_speed else 0.0
+
+        our_active_boosts = self._active_boosts(our_active_info.get("boosts", {}))
+        opp_active_boosts = self._active_boosts(opp_active_info.get("boosts", {}))
+
+        our_offense_mult = best_type_multiplier(our_active_types, opp_active_types)
+        opp_offense_mult = best_type_multiplier(opp_active_types, our_active_types)
+
+        our_resist_ratio, our_weak_ratio = self._team_matchup_ratios(our_team, opp_active_types)
+        opp_resist_ratio, opp_weak_ratio = self._team_matchup_ratios(opp_team, our_active_types)
+
         global_num = np.concatenate(
             [
                 side_vec,
@@ -340,6 +521,19 @@ class FeatureBuilder:
                         opp_fainted,
                         our_revealed,
                         opp_revealed,
+                        our_active_hp,
+                        opp_active_hp,
+                        active_hp_diff,
+                        speed_diff,
+                        speed_adv,
+                        *our_active_boosts,
+                        *opp_active_boosts,
+                        our_offense_mult,
+                        opp_offense_mult,
+                        our_resist_ratio,
+                        our_weak_ratio,
+                        opp_resist_ratio,
+                        opp_weak_ratio,
                     ],
                     dtype=np.float32,
                 ),

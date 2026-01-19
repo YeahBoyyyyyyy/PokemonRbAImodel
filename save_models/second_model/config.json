@@ -4,6 +4,6 @@
   "volatile_hash_dim": 8,
   "turn_cap": 100,
   "numeric_dim": 29,
-  "global_dim": 210,
+  "global_dim": 199,
   "val_every": 20
 }
