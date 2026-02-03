@@ -90,6 +90,7 @@ SPECIES_ALIASES = {
     "ogerponwellspringtera": "ogerponwellspring",
     "ogerponhearthflametera": "ogerponhearthflame",
     "ogerponcornerstonetera": "ogerponcornerstone",
+    "vivillongarden": "vivillon",
 }
 
 def normalize_species_name(name: str) -> str:
@@ -146,6 +147,7 @@ def canonicalize_species_norm(norm: str) -> str:
         ("polteageist", "polteageist"),
         ("sinistcha", "sinistcha"),
         ("maushold", "maushold"),
+        ("vivillon", "vivillon"),
     ):
         if base != target and base.startswith(prefix):
             return target
@@ -287,6 +289,7 @@ class FeatureBuilder:
         if not key:
             if species not in self._warned_species:
                 self._warned_species.add(species)
+            #print(f"Warning: Unknown species '{species}'", file=sys.stderr)
             return None
         return pokemon_data_gen9.get(key)
 
@@ -300,6 +303,7 @@ class FeatureBuilder:
         if not key:
             if species not in self._warned_species:
                 self._warned_species.add(species)
+            #print(f"Warning: Unknown species '{species}'", file=sys.stderr)
             return 0
         return self.species_to_id.get(key, 0)
 
@@ -315,6 +319,7 @@ class FeatureBuilder:
 
     def _base_stats(self, entry: Optional[dict]) -> List[float]:
         if not entry:
+            #print("Warning: Missing pokedex entry for base stats", file=sys.stderr)
             return [0.0] * 6
         stats = entry.get("stats", {})
         return [
@@ -933,7 +938,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_files", type=int, default=0)
     parser.add_argument("--max_examples", type=int, default=0)
     parser.add_argument("--max_val_examples", type=int, default=0)
-    parser.add_argument("--shuffle_buffer", type=int, default=4096)
+    parser.add_argument("--shuffle_buffer", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--baseline_only", action="store_true")
