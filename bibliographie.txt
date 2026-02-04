@@ -1,0 +1,62 @@
+https://blog.stackademic.com/learn-to-build-a-neural-network-from-scratch-yes-really-cac4ca457efc
+https://www.digitalocean.com/community/tutorials/constructing-neural-networks-from-scratch
+https://ayoakin.medium.com/build-a-neural-network-from-scratch-c7e03ad1b501
+
+La Back propagation est déjà une sorte de boucle 
+
+Question de la descente de gradient. Celle-ci va mesurer comment une seule variable impacte le réseau. Le gradient de la fonction C représentant 
+le réseau est NABLA C 
+
+Bibliographie : 
+https://neuralnetworksanddeeplearning.com/chap1.html                                                                # Un blog sur comment fonctionnent les réseaujx
+https://en.wikipedia.org/wiki/Recurrent_neural_network                                                              # Explication des réseaux de neurones récurrents
+https://www.activestate.com/resources/quick-reads/how-to-create-a-neural-network-in-python-with-and-without-keras   # Instructions simples sur comment créer un réseau de neurones en python.
+https://fr.wikipedia.org/wiki/Perceptron                                                                            # Explication du perceptron, base des réseaux de neurones                  
+https://fr.wikipedia.org/wiki/Réseau_de_neurones_artificiels                                                        # Explication des réseaux de neurones artificiels
+https://www.reddit.com/r/neuralnetworks/comments/e9ag3q/would_it_be_possible_to_create_a_neural_network
+https://fr.wikipedia.org/wiki/Q-learning 
+
+# Explication du Q-learning    (la douleur)      
+https://www.youtube.com/watch?v=rhvj7CmTRkg
+
+
+## MCOT
+
+### Article de stanford dans lequel une IA a été entrainée à faire des combats pokémon 
+en VGC, un mode bien plus complexe que le format solo. Ils ont aussi utilisé tensorflow, 
+donc j'imagine que c'est le meilleure option plutôt que de faire un réseau de neurone 
+depuis zéro. L'IA sera toujours plus performante, créer un réseau depuis zéro ne servira 
+à rien puisque le module fera mieux.
+https://cs230.stanford.edu/projects_spring_2022/reports/127608668.pdf
+
+### Gigantesques datasets contenant des millions de parties showdown dans tous les modes,
+notamment en OverUsed et RandomBattle 9G. Ces bases de données sont très pratiques dans 
+notre cas car le téléchargement des parties via l'API de showdown replay était un 
+procéssus assez lent. ###
+https://huggingface.co/datasets/milkkarten/pokechamp
+https://huggingface.co/datasets/HolidayOugi/pokemon-showdown-replays 
+
+## Monte Carlo tree search, permet à l'IA une fois entrainée de pouvoir prédire quel 
+sera le meilleur coup en créant un arbre des possibilités, on peut choisir la profondeur 
+d'exploration.
+https://fr.wikipedia.org/wiki/Recherche_arborescente_Monte-Carlo
+
+### Tout ce qui concerne tensorflow et comment créer un réseau de neurones en utilisant 
+ce module. 
+https://www.tensorflow.org/tutorials/quickstart/beginner?hl=fr 
+https://www.tensorflow.org/api_docs
+
+## Exemple d'une IA qui a réussi à être dans le top ladder des formats solo de showdown 
+mais pas grand n'est indiqué dans la vidéo si ce n'est quelques parties où l'IA à bien 
+réfléchis.
+https://youtu.be/zgjlfgyBzBU?si=7VFUl99Qj3fDhzNN
+
+## Vidéo de quelqu'un ayant développé une IA et expliquant comment il s'y est pris dans 
+les grandes lignes pour la réaliser. 
+https://youtu.be/rhvj7CmTRkg?si=mWPXZXYUeZWeyIh8
+
+
+## Hashes vectors
+https://www.algolia.com/blog/ai/vectors-vs-hashes
+
+## Différences entre IA, machine learning, neural network et deep learning

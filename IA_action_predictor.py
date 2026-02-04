@@ -1,7 +1,7 @@
 """
 Train a model to predict whether the next action is a move or a switch.
 
-Input dataset: JSON list produced by Replay_data/extract_training_data.py
+Input dataset: JSON list produced by PokemonOUaimodel/data_extracors/extract_action_chunks.py
 Each example contains:
   - state (game state)
   - action_type: "move" or "switch"
@@ -23,7 +23,7 @@ import os
 import numpy as np
 import tensorflow as tf
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
@@ -563,10 +563,10 @@ def train(args: argparse.Namespace) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_file", default="Replay_data/training_data.json")
+    parser.add_argument("--input_file", default="action_chunks/training_data.json")
     parser.add_argument("--input_dir", default="")
     parser.add_argument("--base_name", default="action_data")
-    parser.add_argument("--model_dir", default="TensorFlows/action_model")
+    parser.add_argument("--model_dir", default="PokemonOUaimodel/action_model")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--val_every", type=int, default=20)

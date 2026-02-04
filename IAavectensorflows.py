@@ -20,7 +20,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import tensorflow as tf
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
@@ -928,7 +928,7 @@ def predict(args: argparse.Namespace) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default="ou_winrate_chunks")
-    parser.add_argument("--model_dir", default="TensorFlows/ou_winrate_model")
+    parser.add_argument("--model_dir", default="PokemonOUaimodel/ou_winrate_model")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--split_mode", choices=["example", "file"], default="file")

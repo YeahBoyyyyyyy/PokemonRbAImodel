@@ -20,7 +20,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import tensorflow as tf
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
@@ -793,8 +793,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input_file", default="action_chunks/action_data_00001.json")
     parser.add_argument("--input_dir", default="")
     parser.add_argument("--base_name", default="action_data")
-    parser.add_argument("--model_dir", default="TensorFlows/move_model")
-    parser.add_argument("--vocab_file", default="TensorFlows/move_vocab.json")
+    parser.add_argument("--model_dir", default="PokemonOUaimodel/move_model")
+    parser.add_argument("--vocab_file", default="PokemonOUaimodel/move_vocab.json")
     parser.add_argument("--set_dex", default="")
     parser.add_argument("--mismatch_penalty", type=float, default=0.2)
     parser.add_argument("--top_moves", type=int, default=200)
