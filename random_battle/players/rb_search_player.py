@@ -20,8 +20,10 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from common.battle_state_heuristic import move_policy_bonus
 from common.combat_helpers import (
+    best_damaging_move,
     estimate_enemy_worst_damage,
-    is_fast_clean_revenge_switch,
+    estimate_my_damage_on_enemy,
+    score_fast_revenge_switch,
 )
 from common.defensive_switch import (
     has_resist_switch_option,
@@ -322,16 +324,14 @@ class RbSearchPlayer(RbHybridPlayer):
         ]
 
     def _worth_engine_switch(self, battle: AbstractBattle, candidate: Pokemon) -> bool:
-        """Defensive improvement or faster guaranteed clean OHKO — else skip engine."""
+        """Defensive improvement — else skip engine on voluntary switches."""
         my = battle.active_pokemon
         enemy = battle.opponent_active_pokemon
         if my is None or enemy is None:
             return False
-        if switch_improvement_ok(
+        return switch_improvement_ok(
             my, candidate, enemy, min_product_ratio=self.switch_min_improvement
-        ):
-            return True
-        return is_fast_clean_revenge_switch(candidate, enemy)
+        )
 
     def _switch_candidates(
         self,
@@ -341,41 +341,43 @@ class RbSearchPlayer(RbHybridPlayer):
     ) -> List[Pokemon]:
         """Bench mons worth engine-evaluating as switch options this turn.
 
-        Pruned (default): only defensive improvements and fast clean OHKOs.
-        Capped at ``tiebreak_switch_top_k`` to bound engine cost.
+        Pruned (default): defensive improvements on voluntary turns; fast
+        revenge send-in after a faint. Capped at ``tiebreak_switch_top_k``.
         """
         if not switches:
             return []
         enemy = battle.opponent_active_pokemon
         cap = self.tiebreak_switch_top_k
+        forced_send = not list(battle.available_moves or [])
+
+        if forced_send and enemy is not None:
+            pool = list(switches)
+            pool.sort(
+                key=lambda s: (
+                    -score_fast_revenge_switch(s, enemy, active_mon=None),
+                    -self._pivot_matchup_score(s, enemy),
+                ),
+            )
+            return pool[:cap]
+
+        my = battle.active_pokemon
+        if my is not None and not defensively_needed:
+            from common.tactical_rules import pick_scarf_preserving_switch
+
+            if pick_scarf_preserving_switch(switches, my, battle.opponent_active_pokemon) is my:
+                return []
         pool = list(switches)
         if self.engine_prune_switches:
             pool = [s for s in switches if self._worth_engine_switch(battle, s)]
         if not pool:
             return []
 
-        my = battle.active_pokemon
         defensive = (
             self._filter_defensive_switches(battle, pool) if my is not None else []
         )
-        revenge: List[Pokemon] = []
+        picked: List[Pokemon] = list(defensive) if defensive else list(pool)
         if enemy is not None:
-            revenge = [s for s in pool if is_fast_clean_revenge_switch(s, enemy)]
-
-        picked: List[Pokemon] = []
-        for s in defensive + revenge:
-            if s not in picked:
-                picked.append(s)
-        if not picked:
-            picked = list(pool)
-
-        if enemy is not None:
-            picked.sort(
-                key=lambda s: (
-                    0 if s in defensive else 1,
-                    -self._pivot_matchup_score(s, enemy),
-                ),
-            )
+            picked.sort(key=lambda s: -self._pivot_matchup_score(s, enemy))
         return picked[:cap]
 
     def _winrate_kwargs(self) -> dict:
@@ -385,6 +387,45 @@ class RbSearchPlayer(RbHybridPlayer):
             opp_switch_top_k=self.opp_switch_top_k,
             aggregation=self.turn_eval_aggregation,
         )
+
+    def _expected_damage_fraction(
+        self, move: Move, battle: AbstractBattle
+    ) -> float:
+        """Cheap expected chip on the active foe (0..1+), for tiebreaks."""
+        my = battle.active_pokemon
+        enemy = battle.opponent_active_pokemon
+        if my is None or enemy is None:
+            return 0.0
+        est = estimate_my_damage_on_enemy(move, my, enemy)
+        if est is None:
+            return 0.0
+        return float(est.avg_frac)
+
+    def _ensure_damage_move_in_shortlist(
+        self,
+        shortlist: List[Move],
+        available_moves: List[Move],
+        battle: AbstractBattle,
+    ) -> List[Move]:
+        """Always engine-evaluate the best damage move, not only model favorites."""
+        my = battle.active_pokemon
+        enemy = battle.opponent_active_pokemon
+        if my is None or enemy is None:
+            return shortlist
+        best = best_damaging_move(available_moves, my, enemy)
+        if best is None or not isinstance(best, Move):
+            return shortlist
+        if best in shortlist:
+            return shortlist
+        out = list(shortlist)
+        out.append(best)
+        if len(out) > self.tiebreak_top_k:
+            out.sort(
+                key=lambda m: self._expected_damage_fraction(m, battle),
+                reverse=True,
+            )
+            out = out[: self.tiebreak_top_k]
+        return out
 
     def _compute_move_scores(
         self,
@@ -403,6 +444,19 @@ class RbSearchPlayer(RbHybridPlayer):
         for score, move in scores:
             token = normalize_token(getattr(move, "id", ""))
             bonus = move_policy_bonus(token, battle)
+            from common.tactical_rules import move_policy_tactical_bonus
+
+            tag = battle.battle_tag
+            bonus += move_policy_tactical_bonus(
+                token,
+                battle=battle,
+                last_my_move=self._last_my_move.get(tag),
+                last_opp_move=self._last_opp_move.get(tag),
+            )
+            if self._is_damaging_move(move):
+                dmg_frac = self._expected_damage_fraction(move, battle)
+                if dmg_frac > 0.0:
+                    bonus += min(0.22, dmg_frac * 0.30)
             boosted.append((max(0.0, score + bonus), move))
         boosted.sort(key=lambda pair: pair[0], reverse=True)
         return boosted
@@ -442,6 +496,85 @@ class RbSearchPlayer(RbHybridPlayer):
     # ------------------------------------------------------------------
     # Engine plumbing
     # ------------------------------------------------------------------
+
+    def _engine_pick_forced_revenge_switch(
+        self,
+        battle: AbstractBattle,
+        switches: List[Pokemon],
+        enemy: Pokemon,
+    ) -> Optional[Pokemon]:
+        """Engine 1-turn sim after send-in: prefer a line that KOs the foe."""
+        from common.combat_helpers import (
+            pick_best_fast_revenge_switch,
+            score_fast_revenge_switch,
+        )
+
+        evaluator = self._engine_eval
+        if evaluator is None:
+            return None
+
+        ranked: List[tuple[float, Pokemon]] = []
+        for mon in switches:
+            if getattr(mon, "fainted", False):
+                continue
+            sc = score_fast_revenge_switch(mon, enemy, active_mon=None)
+            if sc >= 0.5:
+                ranked.append((sc, mon))
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        ranked = ranked[:4]
+        if not ranked:
+            return None
+
+        state = self._state_dict(battle)
+        branches = self._engine_opp_branches(state)
+
+        best_mon: Optional[Pokemon] = None
+        best_key = (-1.0, -1.0, -1.0)
+
+        for heur_sc, mon in ranked:
+            species = species_name(mon)
+            if not species:
+                continue
+            try:
+                res = evaluator.evaluate_revenge_switch_one_turn(
+                    battle,
+                    my_switch=species,
+                    opp_branches=branches,
+                )
+            except Exception as exc:
+                print(
+                    f"[RbSearchPlayer] revenge switch sim failed ({species}): {exc}"
+                )
+                continue
+            if res.setup_failed:
+                continue
+            ko = 1.0 if res.opp_ko else 0.0
+            key = (ko, res.score, heur_sc)
+            if key > best_key:
+                best_key = key
+                best_mon = mon
+
+        if best_mon is not None and (best_key[0] >= 1.0 or best_key[1] >= 0.58):
+            return best_mon
+
+        return pick_best_fast_revenge_switch(
+            switches,
+            enemy,
+            active_mon=None,
+            min_score=0.85,
+        )
+
+    async def _pick_forced_revenge_switch(
+        self,
+        battle: AbstractBattle,
+        switches: List[Pokemon],
+        enemy: Pokemon,
+    ) -> Optional[Pokemon]:
+        if self.use_engine and self._ensure_engine():
+            picked = self._engine_pick_forced_revenge_switch(battle, switches, enemy)
+            if picked is not None:
+                return picked
+        return await super()._pick_forced_revenge_switch(battle, switches, enemy)
 
     def _ensure_engine(self) -> bool:
         """Lazily create engine simulators and evaluators (one bridge per worker).
@@ -608,7 +741,16 @@ class RbSearchPlayer(RbHybridPlayer):
             branches.append(("move", mv, float(max(w, 1e-6))))
         for sp in enumerate_opponent_switches(state, top_k=self.opp_switch_top_k):
             branches.append(("switch", sp, 0.2))
-        return branches
+        from common.tactical_rules import (
+            filter_opponent_branch_moves,
+            gigaton_hammer_on_cooldown,
+        )
+
+        battle = getattr(self, "_search_battle", None)
+        tag = getattr(battle, "battle_tag", None) if battle else None
+        last_opp = self._last_opp_move.get(tag) if tag else None
+        cooldown = gigaton_hammer_on_cooldown(battle, last_opp_move=last_opp) if battle else False
+        return filter_opponent_branch_moves(branches, gigaton_cooldown=cooldown)
 
     def _fallback_move_win_prob(self, state: Dict[str, object], token: str) -> float:
         assert self._winrate is not None
@@ -769,6 +911,11 @@ class RbSearchPlayer(RbHybridPlayer):
             min_k=self.tiebreak_move_min_k,
             score_ratio=self.tiebreak_move_score_ratio,
         )
+        shortlist = self._ensure_damage_move_in_shortlist(
+            [m for m in shortlist if isinstance(m, Move)],
+            available_moves,
+            battle,
+        )
         if not shortlist:
             return None, -1.0, 0.0
         if self._winrate is None:
@@ -807,12 +954,13 @@ class RbSearchPlayer(RbHybridPlayer):
             m = shortlist[0] if isinstance(shortlist[0], Move) else None
             return m, -1.0, scored[0][0]
 
-        ranked.sort(key=lambda row: (-row[0], -row[1]))
-        if (
-            len(ranked) >= 2
-            and ranked[0][0] - ranked[1][0] < self.tiebreak_min_winrate_gap
-        ):
-            ranked.sort(key=lambda row: -row[1])
+        ranked.sort(
+            key=lambda row: (
+                -row[0],
+                -self._expected_damage_fraction(row[2], battle),
+                -row[1],
+            )
+        )
         best = ranked[0]
         # Log decision (no-op when decision_log_path is None).
         if self.decision_log_path is not None:
@@ -977,6 +1125,7 @@ class RbSearchPlayer(RbHybridPlayer):
     async def choose_move(self, battle: AbstractBattle):
         if battle.in_team_preview:
             return self.choose_random_teampreview(battle)
+        self._sync_tactical_state(battle)
         self._search_battle = battle
         if self.engine_verbose and self.use_engine:
             my = battle.active_pokemon
@@ -992,6 +1141,15 @@ class RbSearchPlayer(RbHybridPlayer):
         else:
             t0 = None
         try:
+            override = await self._try_encore_override(battle)
+            if override is not None:
+                return override
+            override = await self._try_species_tactic_override(battle)
+            if override is not None:
+                return override
+            override = await self._try_tactical_switch_override(battle)
+            if override is not None:
+                return override
             override = await self._try_priority_combat_override(battle)
             if override is not None:
                 return override

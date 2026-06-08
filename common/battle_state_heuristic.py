@@ -292,12 +292,14 @@ def position_score(
     my_hazards: Mapping[str, int],
     opp_hazards: Mapping[str, int],
     active_hp: float = 1.0,
+    opp_active_hp: float = 1.0,
     matchup: float = 0.5,
-    w_hp: float = 0.35,
-    w_alive: float = 0.22,
-    w_hazard: float = 0.18,
-    w_setup: float = 0.12,
-    w_matchup: float = 0.13,
+    w_hp: float = 0.38,
+    w_alive: float = 0.24,
+    w_chip: float = 0.10,
+    w_hazard: float = 0.16,
+    w_setup: float = 0.11,
+    w_matchup: float = 0.06,
 ) -> float:
     """P1 win heuristic in [0, 1], 0.5 = even."""
     my_hp = max(0.0, float(my_hp_total))
@@ -313,12 +315,14 @@ def position_score(
     hazard_term = 0.5 + 0.5 * (opp_hz - my_hz)
 
     setup_term = max(0.0, min(1.0, float(active_hp)))
+    chip_term = 1.0 - max(0.0, min(1.0, float(opp_active_hp)))
 
     matchup_term = max(0.0, min(1.0, float(matchup)))
 
     score = (
         w_hp * hp_ratio
         + w_alive * alive_ratio
+        + w_chip * chip_term
         + w_hazard * hazard_term
         + w_setup * setup_term
         + w_matchup * matchup_term
@@ -357,7 +361,7 @@ def score_from_engine_snap(
         return 0.5
 
     p1_hp, p1_alive, active_hp = _team_stats_from_side(p1_side)
-    p2_hp, p2_alive, _ = _team_stats_from_side(p2_side)
+    p2_hp, p2_alive, opp_active_hp = _team_stats_from_side(p2_side)
 
     my_hazards = _hazard_layers_from_side_conds(p1_side.get("sideConditions") or {})
     opp_hazards = _hazard_layers_from_side_conds(p2_side.get("sideConditions") or {})
@@ -374,6 +378,7 @@ def score_from_engine_snap(
         my_hazards=my_hazards,
         opp_hazards=opp_hazards,
         active_hp=active_hp,
+        opp_active_hp=opp_active_hp,
         matchup=matchup,
     )
 
@@ -383,7 +388,7 @@ def relative_score_from_engine_snaps(
     root: EngineSnapshot,
     *,
     p1_name: str = "Bot",
-    scale: float = 25.0,
+    scale: float = 27.0,
 ) -> float:
     """Score a leaf vs the search root: 0.5 + scale * (pos(leaf) - pos(root)).
 
@@ -426,7 +431,7 @@ def score_from_state_dict(state: Dict[str, Any]) -> float:
     my_team = state.get("my_team") or []
     opp_team = state.get("opp_team") or []
     my_hp, my_alive, active_hp = _side_stats(my_team)
-    opp_hp, opp_alive, _ = _side_stats(opp_team)
+    opp_hp, opp_alive, opp_active_hp = _side_stats(opp_team)
     my_hazards = dict(state.get("my_hazards") or {})
     opp_hazards = dict(state.get("opp_hazards") or {})
 
@@ -457,8 +462,38 @@ def score_from_state_dict(state: Dict[str, Any]) -> float:
         my_hazards=my_hazards,
         opp_hazards=opp_hazards,
         active_hp=active_hp,
+        opp_active_hp=opp_active_hp,
         matchup=matchup,
     )
+
+
+def _team_alive_count(battle: Any, *, opponent: bool) -> int:
+    team = (
+        getattr(battle, "opponent_team", None)
+        if opponent
+        else getattr(battle, "team", None)
+    ) or {}
+    return sum(
+        1 for p in team.values() if p is not None and not getattr(p, "fainted", False)
+    )
+
+
+def late_game_hazard_penalty(battle: Any) -> float:
+    """Penalty magnitude for setting hazards when few switches remain."""
+    opp_alive = _team_alive_count(battle, opponent=True)
+    my_alive = _team_alive_count(battle, opponent=False)
+    total_alive = opp_alive + my_alive
+    turn = int(getattr(battle, "turn", 0) or 0)
+
+    if opp_alive <= 1:
+        return 0.35
+    if opp_alive == 2 and total_alive <= 4:
+        return 0.22
+    if total_alive <= 3:
+        return 0.18
+    if turn >= 28 and opp_alive <= 3:
+        return 0.12
+    return 0.0
 
 
 def move_policy_bonus(move_token: str, battle: Any) -> float:
@@ -494,6 +529,9 @@ def move_policy_bonus(move_token: str, battle: Any) -> float:
             bonus -= 0.10
         elif layers > 0:
             bonus -= 0.04 * (layers / cap)
+        endgame = late_game_hazard_penalty(battle)
+        if endgame > 0.0:
+            bonus -= endgame
 
     if token in HAZARD_CLEAR_MOVES:
         if my_hazards:
@@ -518,6 +556,17 @@ def move_policy_bonus(move_token: str, battle: Any) -> float:
         "rockpolish", "autotomize", "geomancy", "victorydance", "noretreat",
         "workup", "tailglow", "clangoroussoul",
     }
+    if token == "bellydrum" and active is not None:
+        try:
+            from tactical_rules import eiscue_belly_drum_done
+
+            if eiscue_belly_drum_done(active):
+                bonus -= 0.40
+        except Exception:
+            boosts = getattr(active, "boosts", None) or {}
+            if int(boosts.get("atk", 0) or 0) >= 6:
+                bonus -= 0.40
+
     if token in setup_tokens:
         if active_hp >= 0.75:
             bonus += 0.05

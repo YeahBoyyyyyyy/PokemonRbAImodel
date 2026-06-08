@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
+import re
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -30,7 +33,16 @@ from random_battle.config import (
     MOVE_VOCAB_PATH,
     MULTIHEAD_MODEL_DIR,
     RB_SET_DEX_PATH,
+    REPLAYS_DIR,
+    SESSION_DIR,
     WINRATE_MODEL_DIR,
+)
+from random_battle.elo_tracker import EloTracker, attach_elo_tracking
+from random_battle.live_log import attach_live_logging, live_print
+from random_battle.session_log import (
+    attach_session_logging,
+    load_cumulative_stats,
+    write_session_summary,
 )
 from random_battle.players.local_login_patch import apply_local_login_patch
 from random_battle.players.rb_hybrid_player import RbHybridPlayer
@@ -295,11 +307,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--engine_prune_delta",
+        "--prune_delta",
+        dest="engine_prune_delta",
         type=float,
         default=0.15,
+        metavar="DELTA",
         help=(
-            "Élagage: ignore un coup de suivi dont le probe est > delta sous le "
-            "meilleur. Plus petit = plus agressif (plus rapide)."
+            "Élagage de l'arbre expectimax (--use_engine, --engine_depth >= 2) : "
+            "un coup de suivi est ignoré si son probe est plus de DELTA sous le "
+            "meilleur (win-prob 0–1). Plus petit = arbre plus petit, plus rapide "
+            "(ex. 0.08 agressif, 0.25 conservateur). Défaut: 0.15."
         ),
     )
     parser.add_argument(
@@ -407,27 +424,192 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.52,
         help="Au-dessus: le modèle attaque plutôt que switch (hybride défaut 0.52).",
     )
+    parser.add_argument(
+        "--save_replays",
+        nargs="?",
+        const="default",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Sauvegarde les replays HTML (poke-env). Sans chemin : "
+            "random_battle/artifacts/replays/"
+        ),
+    )
+    parser.add_argument(
+        "--session_stats",
+        type=str,
+        default=None,
+        help=(
+            "Fichier JSONL : une ligne par combat (won, opponent, turns). "
+            "Défaut auto si --save_replays ou mode ladder/accept official."
+        ),
+    )
+    parser.add_argument(
+        "--session_summary",
+        type=str,
+        default=None,
+        help="JSON récap en fin de session (wins/losses/win_rate).",
+    )
+    parser.add_argument(
+        "--cumulative_stats",
+        type=str,
+        default=None,
+        help=(
+            "JSON cumulatif des victoires sur plusieurs sessions "
+            "(défaut: artifacts/sessions/cumulative.json)."
+        ),
+    )
+    parser.add_argument(
+        "--live_log",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Logs stderr lisibles : connexion, file ladder, tours, coups joués. "
+            "Défaut : activé en ladder/accept official."
+        ),
+    )
+    parser.add_argument(
+        "--track_elo",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Suivi Elo Showdown (live + JSONL + cumulative). "
+            "Défaut : activé en ladder/accept official."
+        ),
+    )
+    parser.add_argument(
+        "--elo_history",
+        type=str,
+        default=None,
+        help="JSONL historique Elo par combat (défaut auto si --track_elo).",
+    )
+    parser.add_argument(
+        "--log_level",
+        choices=("warning", "info", "debug"),
+        default="info",
+        help="Niveau de log poke-env (connexion websocket, etc.).",
+    )
     return parser
+
+
+def _resolve_session_paths(args: argparse.Namespace, bot_name: str) -> dict:
+    """Pick replay/stats paths from CLI flags and mode."""
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    safe_bot = re.sub(r"[^a-zA-Z0-9_-]+", "_", bot_name) or "bot"
+    live = args.mode in ("ladder", "accept") and args.server == "official"
+    auto_track = live or args.save_replays is not None
+
+    replays_dir: Optional[Path] = None
+    if args.save_replays is not None:
+        replays_dir = (
+            REPLAYS_DIR / f"{safe_bot}_{stamp}"
+            if args.save_replays == "default"
+            else Path(args.save_replays)
+        )
+
+    stats_path: Optional[Path] = None
+    if args.session_stats:
+        stats_path = Path(args.session_stats)
+    elif auto_track:
+        stats_path = SESSION_DIR / f"{safe_bot}_{stamp}.jsonl"
+
+    summary_path: Optional[Path] = None
+    if args.session_summary:
+        summary_path = Path(args.session_summary)
+    elif auto_track:
+        summary_path = SESSION_DIR / f"{safe_bot}_{stamp}_summary.json"
+
+    cumulative_path: Optional[Path] = None
+    if args.cumulative_stats:
+        cumulative_path = Path(args.cumulative_stats)
+    elif auto_track:
+        cumulative_path = SESSION_DIR / "cumulative.json"
+
+    elo_history_path: Optional[Path] = None
+    track_elo = args.track_elo
+    if track_elo is None:
+        track_elo = live
+    if track_elo:
+        if args.elo_history:
+            elo_history_path = Path(args.elo_history)
+        elif auto_track:
+            elo_history_path = SESSION_DIR / f"{safe_bot}_elo.jsonl"
+
+    return {
+        "replays_dir": replays_dir,
+        "stats_path": stats_path,
+        "summary_path": summary_path,
+        "cumulative_path": cumulative_path,
+        "elo_history_path": elo_history_path,
+        "track_elo": track_elo,
+    }
+
+
+def _print_session_footer(
+    player,
+    *,
+    bot_name: str,
+    args: argparse.Namespace,
+    session_paths: dict,
+) -> None:
+    n_finished = player.n_finished_battles
+    n_won = player.n_won_battles
+    n_lost = max(0, n_finished - n_won)
+    rate = (n_won / n_finished) if n_finished else 0.0
+    print(
+        f"\n=== Session {bot_name} ===\n"
+        f"Combats : {n_finished} | Victoires : {n_won} | Défaites : {n_lost} "
+        f"| Win rate : {rate:.1%}"
+    )
+    summary_path = session_paths.get("summary_path")
+    if summary_path is not None:
+        elo_tracker = getattr(player, "_elo_tracker", None)
+        summary = write_session_summary(
+            summary_path,
+            bot_username=bot_name,
+            n_finished=n_finished,
+            n_won=n_won,
+            mode=args.mode,
+            server=args.server,
+            battle_format=args.battle_format,
+            stats_path=session_paths.get("stats_path"),
+            replays_dir=session_paths.get("replays_dir"),
+            cumulative_path=session_paths.get("cumulative_path"),
+            elo_start=(
+                elo_tracker.session_start_elo if elo_tracker is not None else None
+            ),
+            elo_end=elo_tracker.last_elo if elo_tracker is not None else None,
+        )
+        print(f"Résumé : {summary_path}")
+        if elo_tracker is not None:
+            elo_summary = elo_tracker.format_session_elo_summary()
+            if elo_summary:
+                print(elo_summary)
+            if session_paths.get("elo_history_path"):
+                print(f"Historique Elo : {session_paths['elo_history_path']}")
+        cum_path = session_paths.get("cumulative_path")
+        if cum_path is not None:
+            cum = load_cumulative_stats(cum_path)
+            total_b = int(cum.get("total_battles", 0))
+            total_w = int(cum.get("total_wins", 0))
+            rate_all = (total_w / total_b) if total_b else 0.0
+            print(
+                f"Cumul toutes sessions : {total_w}/{total_b} ({rate_all:.1%}) "
+                f"→ {cum_path}"
+            )
+    if session_paths.get("stats_path"):
+        print(f"Stats JSONL : {session_paths['stats_path']}")
+    if session_paths.get("replays_dir"):
+        print(f"Replays : {session_paths['replays_dir']}")
 
 
 async def run_ladder_session(player, *, n_battles: int, duration_minutes: int) -> None:
     if duration_minutes > 0:
         deadline = time.monotonic() + duration_minutes * 60
-        games = 0
         while time.monotonic() < deadline:
             await player.ladder(1)
-            games += 1
-        print(
-            f"Ladder : {games} combats en {duration_minutes} min "
-            f"({player.n_won_battles} victoires)."
-        )
         return
     await player.ladder(n_battles)
-    total = max(player.n_finished_battles, 1)
-    print(
-        f"Ladder : {player.n_won_battles}/{n_battles} victoires "
-        f"({player.n_won_battles / total:.1%})."
-    )
 
 
 async def main_async(args: argparse.Namespace) -> None:
@@ -469,12 +651,31 @@ async def main_async(args: argparse.Namespace) -> None:
         if ping_interval is None:
             ping_interval = 20.0
 
+    session_paths = _resolve_session_paths(args, bot_name)
+    if session_paths["replays_dir"] is not None:
+        session_paths["replays_dir"].mkdir(parents=True, exist_ok=True)
+
+    log_levels = {
+        "warning": logging.WARNING,
+        "info": logging.INFO,
+        "debug": logging.DEBUG,
+    }
+    live_log = args.live_log
+    if live_log is None:
+        live_log = args.mode in ("ladder", "accept") and args.server == "official"
+
     player_kwargs = dict(
         account_configuration=account,
         server_configuration=server_configuration,
         max_concurrent_battles=args.max_concurrent_battles,
         ping_timeout=ping_timeout,
         ping_interval=ping_interval,
+        save_replays=(
+            str(session_paths["replays_dir"])
+            if session_paths["replays_dir"] is not None
+            else False
+        ),
+        log_level=log_levels.get(args.log_level, logging.INFO),
         model_path=Path(args.model),
         vocab_path=Path(args.vocab),
         set_dex_path=Path(args.set_dex),
@@ -544,7 +745,9 @@ async def main_async(args: argparse.Namespace) -> None:
             if args.engine_n_worlds > 1:
                 mode_label += f" x{args.engine_n_worlds} worlds"
             if args.engine_depth > 1:
-                mode_label += f" {args.engine_depth}-ply (élagué)"
+                mode_label += (
+                    f" {args.engine_depth}-ply (élagué, prune_δ={args.engine_prune_delta})"
+                )
             if args.engine_workers > 1:
                 mode_label += f" x{args.engine_workers} workers"
             if not args.engine_use_model:
@@ -555,6 +758,36 @@ async def main_async(args: argparse.Namespace) -> None:
     else:
         player = RbModelPlayer(**player_kwargs)
         mode_label = "modèle seul"
+
+    elo_tracker: Optional[EloTracker] = None
+    if session_paths.get("track_elo") and args.server == "official":
+        elo_tracker = EloTracker(
+            username=bot_name,
+            battle_format=args.battle_format,
+            history_path=session_paths.get("elo_history_path"),
+            cumulative_path=session_paths.get("cumulative_path"),
+        )
+
+    attach_session_logging(
+        player,
+        stats_path=session_paths.get("stats_path"),
+        bot_username=bot_name,
+    )
+    attach_live_logging(player, bot_username=bot_name, enabled=live_log)
+    if elo_tracker is not None:
+        attach_elo_tracking(
+            player,
+            elo_tracker,
+            stats_path=session_paths.get("stats_path"),
+            live_print_fn=live_print if live_log else None,
+        )
+    if live_log:
+        live_print("Logs live activés (--no-live_log pour désactiver).")
+    live_print(f"Connexion à {server_configuration.websocket_url}...")
+    if session_paths.get("replays_dir"):
+        print(f"Replays → {session_paths['replays_dir']}")
+    if session_paths.get("stats_path"):
+        print(f"Stats JSONL → {session_paths['stats_path']}")
 
     if args.mode == "accept":
         accept_from = None if args.accept_all else args.opponent
@@ -592,10 +825,7 @@ async def main_async(args: argparse.Namespace) -> None:
             print("Accept + engine : max_concurrent_battles forcé à 1.")
             player.max_concurrent_battles = 1
         await player.accept_challenges(accept_from, n_challenges=args.n_challenges)
-        print(
-            f"Combats terminés : {player.n_finished_battles}, "
-            f"victoires : {player.n_won_battles}"
-        )
+        _print_session_footer(player, bot_name=bot_name, args=args, session_paths=session_paths)
         return
 
     if args.mode == "ladder":
@@ -615,6 +845,7 @@ async def main_async(args: argparse.Namespace) -> None:
             n_battles=args.n_battles,
             duration_minutes=args.duration_minutes,
         )
+        _print_session_footer(player, bot_name=bot_name, args=args, session_paths=session_paths)
         return
 
     opponent_cls = OPPONENTS[args.vs]
@@ -630,8 +861,7 @@ async def main_async(args: argparse.Namespace) -> None:
         f"vs {opp_account.username} ({args.battle_format})..."
     )
     await player.battle_against(opponent, n_battles=args.n_battles)
-    total = max(player.n_finished_battles, 1)
-    print(f"{bot_name}: {player.n_won_battles}/{args.n_battles} victoires ({player.n_won_battles / total:.1%})")
+    _print_session_footer(player, bot_name=bot_name, args=args, session_paths=session_paths)
 
 
 def main() -> None:

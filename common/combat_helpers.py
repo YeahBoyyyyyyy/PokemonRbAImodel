@@ -190,14 +190,108 @@ def _damaging_moves_from_mon(mon: object) -> List[object]:
     return []
 
 
+def ko_potential_score(
+    moves: Iterable[object],
+    attacker: object,
+    defender: object,
+) -> float:
+    """Higher = more likely to KO on switch-in (3.0 = clean guaranteed OHKO)."""
+    if defender is None or attacker is None:
+        return 0.0
+    enemy_hp = float(getattr(defender, "current_hp_fraction", None) or 1.0)
+    best = 0.0
+    for move in moves:
+        if is_clean_damaging_move(move) and can_guaranteed_ko_on_hit(
+            move, attacker, defender
+        ):
+            return 3.0
+        est = estimate_my_damage_on_enemy(move, attacker, defender)
+        if est is None:
+            continue
+        if est.min_frac >= enemy_hp:
+            best = max(best, 2.6)
+        elif est.max_frac >= enemy_hp:
+            best = max(best, 2.0 + 0.35 * est.ko_chance)
+        elif est.max_frac >= enemy_hp * 0.72:
+            best = max(best, 1.35 + 0.45 * est.ko_chance)
+        else:
+            best = max(best, est.ko_chance * 0.55)
+    return best
+
+
+def score_fast_revenge_switch(
+    bench: object,
+    enemy_mon: object,
+    *,
+    active_mon: Optional[object] = None,
+    require_faster_than_active: bool = False,
+) -> float:
+    """Score a bench mon: outspeeds foe + KO potential (+ bonus vs active speed)."""
+    if enemy_mon is None or getattr(bench, "fainted", False):
+        return -1.0
+    spe_bench = estimate_pokemon_speed(bench)
+    spe_enemy = estimate_pokemon_speed(enemy_mon)
+    if spe_bench <= spe_enemy:
+        return -1.0
+    if require_faster_than_active and active_mon is not None:
+        if spe_bench <= estimate_pokemon_speed(active_mon):
+            return -1.0
+    ko = ko_potential_score(_damaging_moves_from_mon(bench), bench, enemy_mon)
+    if ko < 0.75:
+        return -1.0
+    speed_margin = (spe_bench - spe_enemy) / max(spe_enemy, 1.0)
+    score = ko * (1.0 + 0.4 * min(1.5, speed_margin))
+    if active_mon is not None:
+        spe_active = estimate_pokemon_speed(active_mon)
+        if spe_bench > spe_active:
+            active_margin = (spe_bench - spe_active) / max(spe_active, 1.0)
+            score *= 1.0 + 0.2 * min(1.0, active_margin)
+    return score
+
+
+def pick_best_fast_revenge_switch(
+    switches: Iterable[object],
+    enemy_mon: object,
+    *,
+    active_mon: Optional[object] = None,
+    require_faster_than_active: bool = False,
+    min_score: float = 1.0,
+) -> Optional[object]:
+    """Best bench Pokémon that is faster and can likely KO."""
+    best: Optional[object] = None
+    best_score = float(min_score)
+    for mon in switches:
+        if getattr(mon, "fainted", False):
+            continue
+        sc = score_fast_revenge_switch(
+            mon,
+            enemy_mon,
+            active_mon=active_mon,
+            require_faster_than_active=require_faster_than_active,
+        )
+        if sc > best_score:
+            best_score = sc
+            best = mon
+    return best
+
+
 def is_fast_clean_revenge_switch(bench: object, enemy_mon: object) -> bool:
     """Bench mon outspeeds the foe and has a guaranteed clean OHKO on switch-in."""
-    if enemy_mon is None or getattr(bench, "fainted", False):
-        return False
-    if estimate_pokemon_speed(bench) <= estimate_pokemon_speed(enemy_mon):
-        return False
-    moves = _damaging_moves_from_mon(bench)
-    return find_clean_guaranteed_ko_move(moves, bench, enemy_mon) is not None
+    return score_fast_revenge_switch(bench, enemy_mon) >= 2.9
+
+
+def is_fast_revenge_switch(
+    bench: object,
+    enemy_mon: object,
+    *,
+    active_mon: Optional[object] = None,
+    min_score: float = 1.15,
+) -> bool:
+    """Faster than foe with meaningful KO potential on switch-in."""
+    return (
+        score_fast_revenge_switch(bench, enemy_mon, active_mon=active_mon)
+        >= min_score
+    )
 
 
 def find_fastest_revenge_killer(
@@ -207,30 +301,14 @@ def find_fastest_revenge_killer(
     active_mon: Optional[object] = None,
     require_faster_than_active: bool = False,
 ) -> Optional[object]:
-    """Bench Pokémon that outspeeds the foe and has a clean guaranteed KO."""
-    if enemy_mon is None:
-        return None
-    enemy_spe = estimate_pokemon_speed(enemy_mon)
-    active_spe = (
-        estimate_pokemon_speed(active_mon) if active_mon is not None else -1
+    """Bench Pokémon that outspeeds the foe and has the best revenge-KO score."""
+    return pick_best_fast_revenge_switch(
+        switches,
+        enemy_mon,
+        active_mon=active_mon,
+        require_faster_than_active=require_faster_than_active,
+        min_score=1.0,
     )
-    best: Optional[object] = None
-    best_spe = -1
-    for mon in switches:
-        if getattr(mon, "fainted", False):
-            continue
-        spe = estimate_pokemon_speed(mon)
-        if spe <= enemy_spe:
-            continue
-        if require_faster_than_active and active_mon is not None and spe <= active_spe:
-            continue
-        moves = _damaging_moves_from_mon(mon)
-        if find_clean_guaranteed_ko_move(moves, mon, enemy_mon) is None:
-            continue
-        if spe > best_spe:
-            best_spe = spe
-            best = mon
-    return best
 
 
 def _move_attributes(move: object) -> Optional[tuple]:

@@ -23,6 +23,8 @@ MULTIHEAD_MODEL_DIR = ARTIFACTS_DIR / "multihead_model"
 ACTION_MODEL_DIR = ARTIFACTS_DIR / "action_model"
 MOVE_MODEL_DIR = ARTIFACTS_DIR / "move_model"
 WINRATE_MODEL_DIR = ARTIFACTS_DIR / "winrate_model"
+REPLAYS_DIR = ARTIFACTS_DIR / "replays"
+SESSION_DIR = ARTIFACTS_DIR / "sessions"
 
 ACTION_CHUNKS_DIR = PROJECT_ROOT / "random_battle" / "chunks" / "action"
 ACTION_CHUNKS_HOLIDAYOUGI_DIR = PROJECT_ROOT / "random_battle" / "chunks" / "action_holidayougi"

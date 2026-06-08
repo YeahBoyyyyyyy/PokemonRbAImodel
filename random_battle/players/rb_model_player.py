@@ -40,7 +40,7 @@ setup_import_paths(shared_data=True, rb_data=True)
 
 from materials import type_effectiveness
 
-from common.combat_helpers import should_terastallize
+from common.combat_helpers import can_guaranteed_ko_on_hit, should_terastallize
 
 from random_battle.models.IA_multihead_predictor import (  # noqa: E402
     Config,
@@ -196,6 +196,50 @@ class RbModelPlayer(Player):
         self._setups_used_active: Dict[str, Dict[str, int]] = {}
         # Si poke-env n'a pas encore le statut (1 tour de retard), on se souvient du dernier statut visé
         self._pending_opp_status: Dict[str, str] = {}
+        self._protect_streak: Dict[str, int] = {}
+        self._bellydrum_used: Dict[str, Set[str]] = {}
+
+    def _sync_tactical_state(self, battle: AbstractBattle) -> None:
+        from common.tactical_rules import extract_last_opponent_move
+
+        tag = battle.battle_tag
+        opp_move = extract_last_opponent_move(battle)
+        if opp_move:
+            self._last_opp_move[tag] = opp_move
+        last_my = normalize_token(self._last_my_move.get(tag) or "")
+        if last_my in {"protect", "detect", "spikyshield", "kingsshield", "banefulbunker"}:
+            self._protect_streak[tag] = self._protect_streak.get(tag, 0) + 1
+        elif last_my:
+            self._protect_streak[tag] = 0
+
+    def _eiscue_belly_drum_used(self, battle: AbstractBattle) -> bool:
+        tag = battle.battle_tag
+        mon_key = self._active_mon_setup_key(battle)
+        if not mon_key:
+            return False
+        return mon_key in self._bellydrum_used.get(tag, set())
+
+    def _filter_tactical_moves(
+        self, moves: List[Move], battle: Optional[AbstractBattle]
+    ) -> List[Move]:
+        if battle is None or not moves:
+            return moves
+        from common.tactical_rules import filter_moves_tactical, strip_eiscue_belly_drum
+
+        tag = battle.battle_tag
+        moves = filter_moves_tactical(
+            moves,
+            battle=battle,
+            last_my_move=self._last_my_move.get(tag),
+            protect_streak=self._protect_streak.get(tag, 0),
+        )
+        if battle is not None:
+            moves = strip_eiscue_belly_drum(
+                moves,
+                battle,
+                already_used=self._eiscue_belly_drum_used(battle),
+            )
+        return moves
 
     def _state_dict(self, battle: AbstractBattle) -> Dict[str, object]:
         return battle_to_state_dict(
@@ -517,6 +561,10 @@ class RbModelPlayer(Player):
 
     def _is_redundant_status_move(self, move: Move, battle: AbstractBattle) -> bool:
         token = normalize_token(move.id)
+        from random_battle.players.rb_move_filters import sleep_clause_blocks_move
+
+        if sleep_clause_blocks_move(battle, token):
+            return True
         applies = MOVE_APPLIES_STATUS.get(token)
         if not applies and not is_status_inflictor_move(token):
             return False
@@ -567,7 +615,14 @@ class RbModelPlayer(Player):
         available_moves: List[Move],
         battle: Optional[AbstractBattle],
     ) -> List[Move]:
+        if battle is not None:
+            from common.tactical_rules import encored_forced_move
+
+            forced = encored_forced_move(battle, available_moves)
+            if forced is not None:
+                return [forced]
         moves = self._filter_moves_for_setup(available_moves, battle)
+        moves = self._filter_tactical_moves(moves, battle)
         if battle is None:
             return moves
         moves = self._filter_type_matchup(moves, battle)
@@ -703,6 +758,10 @@ class RbModelPlayer(Player):
             if token:
                 tag = battle.battle_tag
                 self._last_my_move[tag] = token
+                if token == "bellydrum":
+                    mon_key = self._active_mon_setup_key(battle)
+                    if mon_key:
+                        self._bellydrum_used.setdefault(tag, set()).add(mon_key)
                 if self._is_setup_move(move):
                     self._setups_used[tag] = self._setups_used.get(tag, 0) + 1
                     mon_key = self._active_mon_setup_key(battle)
@@ -778,9 +837,20 @@ class RbModelPlayer(Player):
     ) -> bool:
         if not can_tera or move is None:
             return False
-        return should_terastallize(
-            move, battle.active_pokemon, battle.opponent_active_pokemon
+        my = battle.active_pokemon
+        enemy = battle.opponent_active_pokemon
+        from common.tactical_rules import (
+            should_defensive_tera_for_ko,
+            should_defensive_tera_survive_setup,
         )
+
+        if should_defensive_tera_for_ko(move, my, enemy, can_tera=can_tera):
+            return True
+        if should_defensive_tera_survive_setup(my, enemy, can_tera=can_tera):
+            return True
+        if can_guaranteed_ko_on_hit(move, my, enemy):
+            return should_terastallize(move, my, enemy)
+        return False
 
     def _fallback(self, available_moves, available_switches, can_tera: bool):
         if available_moves:

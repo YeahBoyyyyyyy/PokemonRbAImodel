@@ -47,6 +47,19 @@ MOVE_APPLIES_STATUS: Dict[str, str] = {
 
 MAJOR_STATUS = frozenset({"par", "brn", "slp", "frz", "psn", "tox"})
 
+# Sleep clause (ladder): cannot put a second foe to sleep.
+SLEEP_CLAUSE_MOVES = frozenset(
+    {
+        "yawn",
+        "spore",
+        "sleeppowder",
+        "hypnosis",
+        "lovelykiss",
+        "darkvoid",
+        "sing",
+    }
+)
+
 # Types défenseurs immunisés à certains statuts (Gen 9)
 _DEFENDER_TYPE_STATUS_IMMUNITY: Dict[str, frozenset[str]] = {
     "steel": frozenset({"psn", "tox"}),
@@ -98,3 +111,36 @@ def status_move_blocked(
     if block_if_any_major_status:
         return True
     return applies == current
+
+
+def _pokemon_status(mon: object) -> Optional[str]:
+    if mon is None:
+        return None
+    status = getattr(mon, "status", None)
+    if status is None:
+        return None
+    name = getattr(status, "name", status)
+    return normalize_status(str(name).lower() if name else None)
+
+
+def opponent_team_has_sleeping_mon(battle: object) -> bool:
+    """True if any non-fainted opponent is currently asleep."""
+    team = getattr(battle, "opponent_team", None) or {}
+    for mon in team.values():
+        if mon is None or getattr(mon, "fainted", False):
+            continue
+        if _pokemon_status(mon) == "slp":
+            return True
+    return False
+
+
+def sleep_clause_blocks_move(battle: object, token: str) -> bool:
+    """Sleep clause: no second sleep on a different foe mon."""
+    if not token or token not in SLEEP_CLAUSE_MOVES:
+        return False
+    if not opponent_team_has_sleeping_mon(battle):
+        return False
+    enemy = getattr(battle, "opponent_active_pokemon", None)
+    if enemy is None:
+        return True
+    return _pokemon_status(enemy) != "slp"

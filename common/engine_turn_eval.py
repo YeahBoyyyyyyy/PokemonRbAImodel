@@ -50,6 +50,16 @@ class TurnEvalResult:
     setup_failed: bool = False
 
 
+@dataclass
+class RevengeSwitchEvalResult:
+    """One-turn lookahead after a forced switch-in (post-KO send)."""
+
+    score: float
+    opp_ko: bool
+    best_move: Optional[str] = None
+    setup_failed: bool = False
+
+
 class EngineTurnEvaluator:
     """Wraps an EngineSimulator for 1-ply turn evaluations.
 
@@ -80,7 +90,7 @@ class EngineTurnEvaluator:
         prune_my_move_delta: float = 0.15,
         win_cutoff: float = 0.92,
         loss_cutoff: float = 0.08,
-        relative_heuristic_scale: float = 25.0,
+        relative_heuristic_scale: float = 27.0,
         min_switch_remaining_depth: int = 2,
         verbose: bool = False,
         progress_every_s: float = 5.0,
@@ -217,6 +227,118 @@ class EngineTurnEvaluator:
             opp_branches=opp_branches,
             terastallize=False,
             seed=seed,
+        )
+
+    def evaluate_revenge_switch_one_turn(
+        self,
+        battle: Any,
+        *,
+        my_switch: str,
+        opp_branches: Sequence[OpponentBranch],
+        seed: Optional[Sequence[int]] = None,
+    ) -> RevengeSwitchEvalResult:
+        """Send ``my_switch`` after a KO, then simulate one full attack turn.
+
+        Picks our best damaging line (max over legal moves) against the
+        opponent branches and reports whether the foe active can be KO'd.
+        """
+        if seed is None:
+            seed = [1, 2, 3, 4]
+        try:
+            base_snaps = self.sim.setup_from_battle_variants(
+                battle, n_variants=1, seed=seed
+            )
+        except Exception:
+            return RevengeSwitchEvalResult(0.5, False, setup_failed=True)
+        if not base_snaps:
+            return RevengeSwitchEvalResult(0.5, False, setup_failed=True)
+
+        base_snap = base_snaps[0]
+        opp_branches = list(opp_branches)
+        if not opp_branches:
+            opp_branches = self._adaptive_opp_branches(base_snap)
+
+        my_choice = self.sim.choice_for_switch(base_snap, "p1", my_switch)
+        if not my_choice or my_choice == "default":
+            return RevengeSwitchEvalResult(0.5, False, setup_failed=True)
+
+        try:
+            snap = self.sim.apply_choices(
+                self.sim.fork(base_snap),
+                my_choice=my_choice,
+                opp_choice=None,
+                seed=seed,
+                auto_force_switch=False,
+            )
+        except Exception:
+            return RevengeSwitchEvalResult(0.5, False, setup_failed=True)
+
+        if self.sim.ended(snap):
+            won = snap.get("winner") == self.sim.cfg.p1_name
+            return RevengeSwitchEvalResult(
+                1.0 if won else 0.0,
+                self._opp_side_active_fainted(snap),
+            )
+
+        snap = self._resolve_to_move_phase(snap, seed=seed)
+        if self.sim.ended(snap):
+            won = snap.get("winner") == self.sim.cfg.p1_name
+            return RevengeSwitchEvalResult(
+                1.0 if won else 0.0,
+                self._opp_side_active_fainted(snap),
+            )
+
+        my_moves = self._legal_my_moves(snap)
+        if not my_moves:
+            return RevengeSwitchEvalResult(0.5, False)
+
+        base_state: Optional[Dict[str, Any]] = None
+        if self.base_state_fn is not None:
+            try:
+                base_state = self.base_state_fn(battle)
+            except Exception:
+                base_state = None
+
+        weights = [max(w, 1e-6) for _, _, w in opp_branches]
+        best_score = -1.0
+        best_ko = False
+        best_move: Optional[str] = None
+
+        for mv in my_moves:
+            branch_scores: List[float] = []
+            branch_kos: List[bool] = []
+            for branch in opp_branches:
+                opp_choice = self._opp_choice(snap, branch)
+                my_move_choice = self.sim.choice_for_move(snap, "p1", mv)
+                try:
+                    nxt = self._apply(snap, my_move_choice, opp_choice, seed)
+                except Exception:
+                    branch_scores.append(0.5)
+                    branch_kos.append(False)
+                    continue
+                ko = self._opp_side_active_fainted(nxt)
+                branch_kos.append(ko)
+                if ko:
+                    branch_scores.append(1.0)
+                elif self.sim.ended(nxt):
+                    branch_scores.append(
+                        1.0 if nxt.get("winner") == self.sim.cfg.p1_name else 0.0
+                    )
+                else:
+                    branch_scores.append(
+                        self._score_snap(nxt, base_state, root_snap=base_snap)
+                    )
+            agg = self._aggregate(branch_scores, weights, self.aggregation)
+            ko_flag = any(branch_kos)
+            if agg > best_score or (ko_flag and not best_ko):
+                best_score = agg
+                best_ko = ko_flag or best_ko
+                best_move = mv
+
+        return RevengeSwitchEvalResult(
+            max(0.0, min(1.0, best_score)),
+            best_ko,
+            best_move=best_move,
         )
 
     # ------------------------------------------------------------------
@@ -683,6 +805,50 @@ class EngineTurnEvaluator:
             if mid:
                 out.append(str(mid))
         return out
+
+    @staticmethod
+    def _opp_side_active_fainted(snap: EngineSnapshot) -> bool:
+        from pkmn_engine_simulator import _active_pokemon, _parse_condition
+
+        active = _active_pokemon(snap, "p2")
+        if not active:
+            return True
+        cur, _mx, status = _parse_condition(active.get("condition"))
+        if status == "fnt" or cur == 0:
+            return True
+        return False
+
+    def _resolve_to_move_phase(
+        self,
+        snap: EngineSnapshot,
+        *,
+        seed: Optional[Sequence[int]],
+    ) -> EngineSnapshot:
+        """Advance until both sides can choose moves (or battle ends)."""
+        for _ in range(4):
+            if self.sim.ended(snap):
+                return snap
+            requests = snap.get("requests") or {}
+            p1_req = requests.get("p1") or {}
+            p2_req = requests.get("p2") or {}
+            if p1_req.get("active") and p2_req.get("active"):
+                return snap
+            p1_choice = None
+            p2_choice = None
+            if p1_req.get("forceSwitch"):
+                p1_choice = self.sim._first_legal_switch(snap, "p1") or "default"
+            if p2_req.get("forceSwitch"):
+                p2_choice = self.sim._first_legal_switch(snap, "p2") or "default"
+            if p1_choice is None and p2_choice is None:
+                return snap
+            snap = self.sim.apply_choices(
+                self.sim.fork(snap),
+                my_choice=p1_choice,
+                opp_choice=p2_choice,
+                seed=seed,
+                auto_force_switch=False,
+            )
+        return snap
 
     def _legal_opp_switches(self, snap: EngineSnapshot) -> List[str]:
         """Species of ``p2``'s non-active, non-fainted bench mons."""

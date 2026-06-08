@@ -43,6 +43,11 @@ def opponent_moves_for_state(
     min_prob: float = 0.03,
     mismatch_penalty: float = 0.15,
 ) -> List[str]:
+    from common.tactical_rules import opponent_encored_move
+
+    encored = opponent_encored_move(state)
+    if encored:
+        return [encored]
     opp = _active_mon(state, opponent=True)
     if not opp:
         return []
