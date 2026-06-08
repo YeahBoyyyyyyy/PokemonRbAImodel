@@ -1,0 +1,16 @@
+{
+  "name": "rb-sim-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js bridge between the Python RB AI and the Pokemon Showdown simulator (@pkmn/sim).",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js",
+    "smoke": "node smoke_test.js"
+  },
+  "dependencies": {
+    "@pkmn/sim": "^0.9.20",
+    "@pkmn/dex": "^0.9.20",
+    "@pkmn/data": "^0.9.20"
+  }
+}

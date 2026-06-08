@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.venv/
+venv/
+venv311/
+.env
+.env.*
+
+# Node
+sim_bridge/node_modules/
+
+# Training data & large artifacts (regenerate locally)
+random_battle/chunks/
+random_battle/artifacts/**/*.keras
+random_battle/artifacts/**/*.h5
+random_battle/artifacts/**/*.log
+random_battle/artifacts/winrate_model/
+random_battle/artifacts/multihead_model/
+random_battle/artifacts/action_model/
+random_battle/artifacts/move_model/
+
+# Keep small tracked artifacts
+!random_battle/artifacts/.gitkeep
+!random_battle/artifacts/move_vocab.json
+
+# Debug / local runs
+artifacts/
+*.jsonl
+debug/
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# LaTeX / presentation (outside this package)
+*.aux
+*.log
+*.synctex.gz
+_minted/
