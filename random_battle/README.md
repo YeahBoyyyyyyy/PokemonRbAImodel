@@ -46,7 +46,7 @@ python random_battle/models/IA_multihead_predictor.py \
   --epochs 10
 ```
 
-Différences vs OU (`ou/models/IA_multihead_predictor.py`) :
+Spécificités du modèle RB :
 - `set_dex` = randbats (`rb_set_dex.json`) + `move_prior` + `opp_move_prior`
 - HP inconnu = `-1` + feature `hp_known`
 - Feature `revealed` pour l'adversaire
@@ -91,7 +91,7 @@ Les heuristiques rapides du hybrid (best_damaging_move, Tera, switch défensif) 
 
 ## Jouer en local (serveur + bot)
 
-**Terminal 1 — serveur Showdown** (depuis la racine `IA Pokemon`) :
+**Terminal 1 — serveur Showdown** (depuis `PokemonRbAImodel`) :
 
 ```powershell
 cd PokemonRbAImodel/random_battle
@@ -122,7 +122,7 @@ Sur le client Showdown local (`http://localhost:8000`), défie **RbModelBot** en
 python random_battle/run_rb_model_player.py --mode battle --vs low --n_battles 200 --search --use_engine --engine_n_worlds 5
 
 # Analyser un log de décisions JSONL
-python random_battle/analyze_decision_log.py artifacts/debug/decisions_*.jsonl
+python random_battle/analyze_decision_log.py random_battle/artifacts/debug/decisions_*.jsonl
 ```
 
 Heuristique avancée orientée RB : `common/players/heuristics_pokemon_ai.py` (`HighHeuristicAI`).
