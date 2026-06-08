@@ -72,6 +72,7 @@ class RbSearchPlayer(RbHybridPlayer):
         # Lookahead depth for engine move eval. 1 = 1-ply, 2/3 = expectimax
         # over the next turn(s) with pruning (see EngineTurnEvaluator).
         engine_depth: int = 1,
+        engine_switch_min_depth: int = 2,
         engine_depth2_opp_top_k: int = 3,
         engine_depth2_my_top_k: int = 3,
         engine_deep_opp_move_cap: int = 4,
@@ -121,6 +122,7 @@ class RbSearchPlayer(RbHybridPlayer):
         )
         self.engine_use_model = bool(engine_use_model)
         self.engine_depth = max(1, int(engine_depth))
+        self.engine_switch_min_depth = max(0, int(engine_switch_min_depth))
         self.engine_depth2_opp_top_k = max(1, int(engine_depth2_opp_top_k))
         self.engine_depth2_my_top_k = max(1, int(engine_depth2_my_top_k))
         self.engine_deep_opp_move_cap = max(1, int(engine_deep_opp_move_cap))
@@ -306,6 +308,7 @@ class RbSearchPlayer(RbHybridPlayer):
                 model_evaluator=model_evaluator,
                 base_state_fn=base_state_fn,
                 search_depth=self.engine_depth,
+                min_switch_remaining_depth=self.engine_switch_min_depth,
                 depth2_opp_top_k=self.engine_depth2_opp_top_k,
                 depth2_my_top_k=self.engine_depth2_my_top_k,
                 deep_opp_move_cap=self.engine_deep_opp_move_cap,

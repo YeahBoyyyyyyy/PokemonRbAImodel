@@ -81,6 +81,7 @@ class EngineTurnEvaluator:
         win_cutoff: float = 0.92,
         loss_cutoff: float = 0.08,
         relative_heuristic_scale: float = 25.0,
+        min_switch_remaining_depth: int = 2,
         verbose: bool = False,
         progress_every_s: float = 5.0,
     ) -> None:
@@ -103,9 +104,14 @@ class EngineTurnEvaluator:
             1 = 1-ply (our move -> opp reply -> score). 2 / 3 = expectimax
             over the next turn(s): at each of OUR nodes we take the best
             follow-up (max), at each OPPONENT node we aggregate their likely
-            replies. Switches are only evaluated at the root (deeper plies
-            explore our follow-up *moves*). Depth >= 2 is much slower; use
-            small ``n_opponent_worlds`` and the pruning knobs below.
+            replies. Deeper plies only explore our follow-up *moves* (not
+            further switches). Root switch candidates use at least
+            ``min_switch_remaining_depth`` full turns of lookahead after the
+            pivot (default 2) so revenge-kill lines stay visible even when
+            ``search_depth`` is low. Depth >= 2 is much slower; use small
+            ``n_opponent_worlds`` and the pruning knobs below.
+        min_switch_remaining_depth: minimum full turns simulated after a
+            root switch before scoring (>= 2 recommended for offensive pivots).
         depth2_opp_top_k: legacy, kept for compatibility (deep opponent move
             branches are now capped by ``deep_opp_move_cap``).
         depth2_my_top_k: number of OUR follow-up moves explored at each deep
@@ -147,6 +153,7 @@ class EngineTurnEvaluator:
         self.win_cutoff = float(win_cutoff)
         self.loss_cutoff = float(loss_cutoff)
         self.relative_heuristic_scale = float(relative_heuristic_scale)
+        self.min_switch_remaining_depth = max(0, int(min_switch_remaining_depth))
         self.verbose = bool(verbose)
         self.progress_every_s = float(progress_every_s)
         # Progress counters (reset per top-level action evaluation).
@@ -292,9 +299,12 @@ class EngineTurnEvaluator:
                 except Exception as exc:
                     self._log(f"[engine]   diag: heuristic FAILED: {exc}")
 
-        # Depth of the lookahead AFTER our own action. Only moves deepen;
-        # switches stay 1-ply.
-        remaining_depth = (self.search_depth - 1) if my_kind == "move" else 0
+        # Full turns to simulate after our action (move or switch).
+        remaining_depth = max(0, self.search_depth - 1)
+        if my_kind == "switch":
+            remaining_depth = max(
+                remaining_depth, self.min_switch_remaining_depth
+            )
 
         per_branch_world_scores: List[List[float]] = [[] for _ in opp_branches]
         weights = [max(w, 1e-6) for _, _, w in opp_branches]

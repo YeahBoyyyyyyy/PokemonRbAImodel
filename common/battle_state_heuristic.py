@@ -160,6 +160,68 @@ def _merge_side(state_side: Mapping[str, Any], req_side: Mapping[str, Any]) -> D
     return out
 
 
+def _species_from_side_mon(mon: Mapping[str, Any]) -> str:
+    spec = mon.get("species")
+    if isinstance(spec, str):
+        m = re.match(r"\[Species:([^\]]+)\]", spec, re.IGNORECASE)
+        if m:
+            return m.group(1).strip().lower()
+        if spec.strip():
+            return spec.strip().lower()
+    details = mon.get("details") or ""
+    if isinstance(details, str) and details.strip():
+        return details.split(",", 1)[0].strip().lower()
+    return ""
+
+
+def _types_for_species(species: str) -> List[str]:
+    if not species:
+        return []
+    try:
+        from defensive_switch import _get_pokedex_entry
+
+        info = _get_pokedex_entry(species)
+        if info:
+            return [str(t).lower() for t in info.get("types", [])]
+    except Exception:
+        pass
+    return []
+
+
+def _active_mon(side: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    for mon in side.get("pokemon") or []:
+        if isinstance(mon, Mapping) and (mon.get("active") or mon.get("isActive")):
+            return mon
+    return None
+
+
+def active_matchup_term(
+    my_active: Optional[Mapping[str, Any]],
+    opp_active: Optional[Mapping[str, Any]],
+) -> float:
+    """0..1 matchup of our active vs revealed opponent active (types only)."""
+    if my_active is None or opp_active is None:
+        return 0.5
+    my_types = _types_for_species(_species_from_side_mon(my_active))
+    opp_types = _types_for_species(_species_from_side_mon(opp_active))
+    if not my_types or not opp_types:
+        return 0.5
+    try:
+        from materials import type_effectiveness
+        from defensive_switch import defensive_type_multipliers
+    except Exception:
+        return 0.5
+
+    off = max(float(type_effectiveness(t, opp_types)) for t in my_types)
+    _prod, taken_max = defensive_type_multipliers(
+        {"species": _species_from_side_mon(my_active)},
+        {"species": _species_from_side_mon(opp_active)},
+    )
+    off_s = min(1.0, max(0.0, (off - 0.25) / 1.75))
+    def_s = min(1.0, max(0.0, (2.0 - float(taken_max)) / 1.75))
+    return 0.55 * off_s + 0.45 * def_s
+
+
 def _sides_from_snap(snap: EngineSnapshot) -> Tuple[Optional[Mapping], Optional[Mapping]]:
     """P1 and P2 side dicts, merging serialized state with compact requests."""
     state = snap.get("state") or {}
@@ -186,10 +248,12 @@ def position_score(
     my_hazards: Mapping[str, int],
     opp_hazards: Mapping[str, int],
     active_hp: float = 1.0,
-    w_hp: float = 0.40,
-    w_alive: float = 0.25,
-    w_hazard: float = 0.20,
-    w_setup: float = 0.15,
+    matchup: float = 0.5,
+    w_hp: float = 0.35,
+    w_alive: float = 0.22,
+    w_hazard: float = 0.18,
+    w_setup: float = 0.12,
+    w_matchup: float = 0.13,
 ) -> float:
     """P1 win heuristic in [0, 1], 0.5 = even."""
     my_hp = max(0.0, float(my_hp_total))
@@ -206,11 +270,14 @@ def position_score(
 
     setup_term = max(0.0, min(1.0, float(active_hp)))
 
+    matchup_term = max(0.0, min(1.0, float(matchup)))
+
     score = (
         w_hp * hp_ratio
         + w_alive * alive_ratio
         + w_hazard * hazard_term
         + w_setup * setup_term
+        + w_matchup * matchup_term
     )
     return max(0.0, min(1.0, score))
 
@@ -250,6 +317,7 @@ def score_from_engine_snap(
 
     my_hazards = _hazard_layers_from_side_conds(p1_side.get("sideConditions") or {})
     opp_hazards = _hazard_layers_from_side_conds(p2_side.get("sideConditions") or {})
+    matchup = active_matchup_term(_active_mon(p1_side), _active_mon(p2_side))
 
     return position_score(
         my_hp_total=p1_hp,
@@ -259,6 +327,7 @@ def score_from_engine_snap(
         my_hazards=my_hazards,
         opp_hazards=opp_hazards,
         active_hp=active_hp,
+        matchup=matchup,
     )
 
 
@@ -307,10 +376,28 @@ def score_from_state_dict(state: Dict[str, Any]) -> float:
         denom = max(len(team), 1)
         return hp_sum / denom, alive, active_hp
 
-    my_hp, my_alive, active_hp = _side_stats(state.get("my_team") or [])
-    opp_hp, opp_alive, _ = _side_stats(state.get("opp_team") or [])
+    my_team = state.get("my_team") or []
+    opp_team = state.get("opp_team") or []
+    my_hp, my_alive, active_hp = _side_stats(my_team)
+    opp_hp, opp_alive, _ = _side_stats(opp_team)
     my_hazards = dict(state.get("my_hazards") or {})
     opp_hazards = dict(state.get("opp_hazards") or {})
+
+    my_active = next(
+        (m for m in my_team if m and m.get("is_active")),
+        None,
+    )
+    opp_active = next(
+        (
+            m
+            for m in opp_team
+            if m
+            and m.get("is_active")
+            and (m.get("revealed") or float(m.get("hp_percent", -1) or -1) >= 0)
+        ),
+        None,
+    )
+    matchup = active_matchup_term(my_active, opp_active)
 
     return position_score(
         my_hp_total=my_hp,
@@ -320,6 +407,7 @@ def score_from_state_dict(state: Dict[str, Any]) -> float:
         my_hazards=my_hazards,
         opp_hazards=opp_hazards,
         active_hp=active_hp,
+        matchup=matchup,
     )
 
 

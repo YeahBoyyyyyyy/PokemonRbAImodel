@@ -218,6 +218,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--engine_switch_min_depth",
+        type=int,
+        default=2,
+        help=(
+            "Tours minimum simulés après un switch racine (pivot + réponse adv "
+            "+ follow-ups). Défaut 2 pour voir les revenge-kills. Plus lent."
+        ),
+    )
+    parser.add_argument(
         "--engine_depth2_my_top_k",
         type=int,
         default=3,
@@ -392,6 +401,7 @@ async def main_async(args: argparse.Namespace) -> None:
             engine_world_aggregation=args.engine_world_aggregation,
             engine_use_model=args.engine_use_model,
             engine_depth=args.engine_depth,
+            engine_switch_min_depth=args.engine_switch_min_depth,
             engine_depth2_my_top_k=args.engine_depth2_my_top_k,
             engine_deep_opp_move_cap=args.engine_deep_opp_move_cap,
             engine_opp_switch_base=args.engine_opp_switch_base,
