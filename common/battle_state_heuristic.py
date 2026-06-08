@@ -20,6 +20,12 @@ HAZARD_SETUP_MOVES = frozenset(
     {"stealthrock", "spikes", "toxicspikes", "stickyweb"}
 )
 HAZARD_CLEAR_MOVES = frozenset({"defog", "rapidspin", "tidyup", "courtchange"})
+RECOVERY_MOVES = frozenset(
+    {
+        "wish", "roost", "recover", "softboiled", "slackoff", "healorder",
+        "moonlight", "synthesis", "rest", "strengthsap",
+    }
+)
 
 EngineSnapshot = Dict[str, Any]
 
@@ -195,31 +201,69 @@ def _active_mon(side: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     return None
 
 
+def _mon_dict_for_bulk(mon: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if mon is None:
+        return {}
+    species = _species_from_side_mon(mon)
+    out: Dict[str, Any] = {"species": species}
+    moves = mon.get("moves")
+    if moves:
+        out["moves"] = moves
+    return out
+
+
+def _active_mon_from_snap(
+    snap: EngineSnapshot, side_key: str
+) -> Optional[Dict[str, Any]]:
+    """Active mon with moves attached from engine request (for bulk weighting)."""
+    p1_side, p2_side = _sides_from_snap(snap)
+    side = p1_side if side_key == "p1" else p2_side
+    active = _active_mon(side or {})
+    if active is None:
+        return None
+    merged = dict(active)
+    req = ((snap.get("requests") or {}).get(side_key) or {})
+    active_req = (req.get("active") or [None])[0]
+    if isinstance(active_req, dict) and active_req.get("moves"):
+        merged["moves"] = active_req["moves"]
+    return merged
+
+
 def active_matchup_term(
     my_active: Optional[Mapping[str, Any]],
     opp_active: Optional[Mapping[str, Any]],
 ) -> float:
-    """0..1 matchup of our active vs revealed opponent active (types only)."""
+    """0..1 matchup: type offense/defense + pokedex bulk (HP/Def/SpD)."""
     if my_active is None or opp_active is None:
         return 0.5
-    my_types = _types_for_species(_species_from_side_mon(my_active))
-    opp_types = _types_for_species(_species_from_side_mon(opp_active))
-    if not my_types or not opp_types:
-        return 0.5
+    my_species = _species_from_side_mon(my_active)
+    opp_species = _species_from_side_mon(opp_active)
+    my_types = _types_for_species(my_species)
+    opp_types = _types_for_species(opp_species)
     try:
         from materials import type_effectiveness
-        from defensive_switch import defensive_type_multipliers
+        from defensive_switch import (
+            defensive_bulk_score,
+            defensive_type_multipliers,
+            normalize_bulk_score,
+        )
     except Exception:
         return 0.5
 
-    off = max(float(type_effectiveness(t, opp_types)) for t in my_types)
-    _prod, taken_max = defensive_type_multipliers(
-        {"species": _species_from_side_mon(my_active)},
-        {"species": _species_from_side_mon(opp_active)},
-    )
-    off_s = min(1.0, max(0.0, (off - 0.25) / 1.75))
-    def_s = min(1.0, max(0.0, (2.0 - float(taken_max)) / 1.75))
-    return 0.55 * off_s + 0.45 * def_s
+    my_ref = _mon_dict_for_bulk(my_active)
+    opp_ref = _mon_dict_for_bulk(opp_active)
+
+    if my_types and opp_types:
+        off = max(float(type_effectiveness(t, opp_types)) for t in my_types)
+        _prod, taken_max = defensive_type_multipliers(my_ref, opp_ref)
+        off_s = min(1.0, max(0.0, (off - 0.25) / 1.75))
+        def_s = min(1.0, max(0.0, (2.0 - float(taken_max)) / 1.75))
+    else:
+        off_s = 0.5
+        def_s = 0.5
+
+    bulk_s = normalize_bulk_score(defensive_bulk_score(my_ref, opp_ref))
+    return 0.30 * off_s + 0.25 * def_s + 0.45 * bulk_s
 
 
 def _sides_from_snap(snap: EngineSnapshot) -> Tuple[Optional[Mapping], Optional[Mapping]]:
@@ -317,7 +361,10 @@ def score_from_engine_snap(
 
     my_hazards = _hazard_layers_from_side_conds(p1_side.get("sideConditions") or {})
     opp_hazards = _hazard_layers_from_side_conds(p2_side.get("sideConditions") or {})
-    matchup = active_matchup_term(_active_mon(p1_side), _active_mon(p2_side))
+    matchup = active_matchup_term(
+        _active_mon_from_snap(snap, "p1"),
+        _active_mon_from_snap(snap, "p2"),
+    )
 
     return position_score(
         my_hp_total=p1_hp,
@@ -383,10 +430,7 @@ def score_from_state_dict(state: Dict[str, Any]) -> float:
     my_hazards = dict(state.get("my_hazards") or {})
     opp_hazards = dict(state.get("opp_hazards") or {})
 
-    my_active = next(
-        (m for m in my_team if m and m.get("is_active")),
-        None,
-    )
+    my_active = next((m for m in my_team if m and m.get("is_active")), None)
     opp_active = next(
         (
             m
@@ -397,7 +441,13 @@ def score_from_state_dict(state: Dict[str, Any]) -> float:
         ),
         None,
     )
-    matchup = active_matchup_term(my_active, opp_active)
+    if opp_active is not None and opp_active.get("moves_seen"):
+        opp_ref = dict(opp_active)
+        seen = list(opp_active.get("moves_seen") or [])
+        opp_ref["moves"] = [{"id": m} for m in seen if m]
+        matchup = active_matchup_term(my_active, opp_ref)
+    else:
+        matchup = active_matchup_term(my_active, opp_active)
 
     return position_score(
         my_hp_total=my_hp,
@@ -416,6 +466,12 @@ def move_policy_bonus(move_token: str, battle: Any) -> float:
     token = _norm(move_token)
     if not token or battle is None:
         return 0.0
+
+    try:
+        from combat_helpers import can_guaranteed_ko_on_hit, is_clean_damaging_move
+    except ImportError:
+        can_guaranteed_ko_on_hit = None  # type: ignore
+        is_clean_damaging_move = None  # type: ignore
 
     my_hazards = _hazards_from_poke_env_side(getattr(battle, "side_conditions", None))
     opp_hazards = _hazards_from_poke_env_side(
@@ -446,16 +502,61 @@ def move_policy_bonus(move_token: str, battle: Any) -> float:
             # Defog also clears our hazards — small penalty if we had opp hazards set.
             bonus -= 0.03 * hazard_pressure(opp_hazards)
 
+    # Delayed / redundant healing.
+    if token in RECOVERY_MOVES:
+        if active_hp >= 0.85:
+            bonus -= 0.30
+        elif active_hp >= 0.65:
+            bonus -= 0.18
+        if token == "wish" and active_hp >= 0.45:
+            bonus -= 0.12
+
     # Setup when healthy; risky when low.
     setup_tokens = {
         "swordsdance", "nastyplot", "calmmind", "dragondance", "quiverdance",
         "irondefense", "bulkup", "coil", "growth", "shellsmash", "agility",
-        "rockpolish", "autotomize", "geomancy", "victorydance",
+        "rockpolish", "autotomize", "geomancy", "victorydance", "noretreat",
+        "workup", "tailglow", "clangoroussoul",
     }
     if token in setup_tokens:
         if active_hp >= 0.75:
             bonus += 0.05
         elif active_hp < 0.45:
             bonus -= 0.06
+        enemy = getattr(battle, "opponent_active_pokemon", None)
+        if enemy is not None and active is not None and active_hp >= 0.60:
+            try:
+                from materials import type_effectiveness
+
+                my_types = list(getattr(active, "types", None) or [])
+                if not my_types:
+                    t1, t2 = getattr(active, "type_1", None), getattr(active, "type_2", None)
+                    my_types = [t for t in (t1, t2) if t is not None]
+                enemy_types = list(getattr(enemy, "types", None) or [])
+                if not enemy_types:
+                    t1, t2 = getattr(enemy, "type_1", None), getattr(enemy, "type_2", None)
+                    enemy_types = [t for t in (t1, t2) if t is not None]
+                off = 1.0
+                for atk in my_types:
+                    off *= float(type_effectiveness(atk, enemy_types))
+                if off >= 2.0:
+                    bonus += 0.12
+            except Exception:
+                pass
+
+    # Finish with a clean guaranteed KO when possible.
+    if can_guaranteed_ko_on_hit is not None and is_clean_damaging_move is not None:
+        enemy = getattr(battle, "opponent_active_pokemon", None)
+        active = getattr(battle, "active_pokemon", None)
+        if enemy is not None and active is not None:
+            for move in getattr(battle, "available_moves", None) or []:
+                mid = _norm(getattr(move, "id", "") or "")
+                if mid != token:
+                    continue
+                if is_clean_damaging_move(move) and can_guaranteed_ko_on_hit(
+                    move, active, enemy
+                ):
+                    bonus += 0.35
+                break
 
     return bonus

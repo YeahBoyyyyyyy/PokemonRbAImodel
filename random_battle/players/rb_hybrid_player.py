@@ -25,8 +25,12 @@ from common.combat_helpers import (
     best_damaging_move,
     estimate_enemy_worst_damage,
     estimate_my_damage_on_enemy,
+    find_clean_guaranteed_ko_move,
+    find_fastest_revenge_killer,
 )
+from common.defensive_switch import estimate_pokemon_speed
 from common.defensive_switch import (
+    has_resist_switch_option,
     needs_defensive_switch,
     pick_best_defensive_switch,
     switch_improvement_ok,
@@ -200,6 +204,77 @@ class RbHybridPlayer(RbModelPlayer):
                 best = max(best, float(move_probs[vid]))
         return best
 
+    def _damaging_moves_for_ko_check(self, moves: List[Move]) -> List[Move]:
+        return [
+            m
+            for m in moves
+            if not self._is_setup_move(m)
+            and (getattr(m, "base_power", 0) or 0) > 0
+            and normalize_token(m.id) not in _NON_SETUP_STATUS
+        ]
+
+    async def _try_priority_combat_override(self, battle: AbstractBattle):
+        """Guaranteed clean KOs and faster revenge switches (always-on)."""
+        available_moves = list(battle.available_moves or [])
+        available_switches = list(battle.available_switches or [])
+        can_tera = getattr(battle, "can_terastallize", False)
+        my = battle.active_pokemon
+        enemy = battle.opponent_active_pokemon
+        if enemy is None:
+            return None
+
+        # 1) Fully-accurate, no-stat-drop KO — skip search entirely.
+        if available_moves and my is not None:
+            damaging = self._damaging_moves_for_ko_check(available_moves)
+            ko_move = find_clean_guaranteed_ko_move(damaging, my, enemy)
+            if ko_move is not None:
+                tera = self._decide_terastallize(ko_move, battle, can_tera=can_tera)
+                order = self.create_order(ko_move, terastallize=tera)
+                self._remember_move(battle, order)
+                return order
+
+        if not available_switches:
+            return None
+
+        # 2) Pivot to a resist (e.g. Torkoal → Vaporeon vs Hydro Pump).
+        if my is not None and has_resist_switch_option(
+            my, enemy, available_switches
+        ):
+            pivot = pick_best_defensive_switch(available_switches, my, enemy)
+            if pivot is not None:
+                return self.create_order(pivot)
+
+        forced_switch = not available_moves
+        enemy_hp = float(getattr(enemy, "current_hp_fraction", None) or 1.0)
+        my_spe = estimate_pokemon_speed(my) if my is not None else -1
+        enemy_spe = estimate_pokemon_speed(enemy)
+
+        # 3) Forced switch after a faint: send the fastest clean revenge killer.
+        if forced_switch:
+            revenge = find_fastest_revenge_killer(
+                available_switches, enemy, active_mon=my
+            )
+            if revenge is not None:
+                return self.create_order(revenge)
+
+        # 4) Optional switch: foe is in KO range but we are slower — pivot faster.
+        if (
+            available_moves
+            and my is not None
+            and enemy_hp <= 0.55
+            and my_spe < enemy_spe
+        ):
+            revenge = find_fastest_revenge_killer(
+                available_switches,
+                enemy,
+                active_mon=my,
+                require_faster_than_active=True,
+            )
+            if revenge is not None:
+                return self.create_order(revenge)
+
+        return None
+
     def _maybe_force_switch(self, battle: AbstractBattle):
         available_switches = list(battle.available_switches or [])
         if not available_switches:
@@ -300,6 +375,10 @@ class RbHybridPlayer(RbModelPlayer):
     async def choose_move(self, battle: AbstractBattle):
         if battle.in_team_preview:
             return self.choose_random_teampreview(battle)
+
+        override = await self._try_priority_combat_override(battle)
+        if override is not None:
+            return override
 
         override = await self._try_heuristic_override(battle)
         if override is not None:

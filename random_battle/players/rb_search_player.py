@@ -19,7 +19,15 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from common.battle_state_heuristic import move_policy_bonus
-from common.defensive_switch import needs_defensive_switch, switch_improvement_ok
+from common.combat_helpers import (
+    estimate_enemy_worst_damage,
+    is_fast_clean_revenge_switch,
+)
+from common.defensive_switch import (
+    has_resist_switch_option,
+    needs_defensive_switch,
+    switch_improvement_ok,
+)
 from common.set_dex_prior import aggregate_move_probabilities
 from random_battle.data_extractors.rb_team_slots import normalize_species_key
 from random_battle.models.IA_multihead_predictor import normalize_token
@@ -81,6 +89,9 @@ class RbSearchPlayer(RbHybridPlayer):
         engine_prune_delta: float = 0.15,
         engine_win_cutoff: float = 0.92,
         engine_verbose: bool = False,
+        engine_workers: int = 1,
+        # Only engine-evaluate switches with a defensive edge or a fast clean OHKO.
+        engine_prune_switches: bool = True,
         # --- Decision logging (post-mortem analysis) ---
         decision_log_path: Optional[Path] = None,
         **kwargs,
@@ -133,6 +144,11 @@ class RbSearchPlayer(RbHybridPlayer):
         self.engine_prune_delta = float(engine_prune_delta)
         self.engine_win_cutoff = float(engine_win_cutoff)
         self.engine_verbose = bool(engine_verbose)
+        self.engine_workers = max(1, int(engine_workers))
+        self.engine_prune_switches = bool(engine_prune_switches)
+        self._engine_sims: List[Any] = []
+        self._engine_evaluators: List[Any] = []
+        self._engine_pool = None
         self._engine_sim = None
         self._engine_eval = None
 
@@ -145,20 +161,150 @@ class RbSearchPlayer(RbHybridPlayer):
             # Truncate so each run starts fresh.
             self.decision_log_path.write_text("", encoding="utf-8")
 
+    def _pivot_matchup_score(self, candidate: Pokemon, enemy: Pokemon) -> float:
+        """Offensive types + bulk (HP/Def/SpD) for switch candidate ranking."""
+        from common.defensive_switch import defensive_bulk_score, normalize_bulk_score
+        from random_battle.players.poke_env_to_state import species_name
+
+        off = self._offensive_matchup(candidate, enemy)
+        off_n = min(1.0, max(0.0, (off - 0.25) / 1.75))
+        bulk = defensive_bulk_score(
+            {"species": species_name(candidate)},
+            enemy,
+        )
+        bulk_n = normalize_bulk_score(bulk)
+        return 0.35 * off_n + 0.65 * bulk_n
+
     def _should_consider_switch(self, battle: AbstractBattle) -> bool:
         my = battle.active_pokemon
         enemy = battle.opponent_active_pokemon
         if my is None or enemy is None:
             return False
         hp = float(my.current_hp_fraction if my.current_hp_fraction is not None else 1.0)
-        return needs_defensive_switch(
+        if needs_defensive_switch(
             my,
             enemy,
             hp_fraction=hp,
             product_taken_threshold=self.switch_critical_adv,
             max_hit_threshold=self.switch_enemy_adv,
             hp_max_hit=self.switch_hp_max_hit,
+        ):
+            return True
+        switches = list(battle.available_switches or [])
+        return has_resist_switch_option(my, enemy, switches)
+
+    def _filter_recovery_spam(
+        self, moves: List[Move], battle: AbstractBattle
+    ) -> List[Move]:
+        """Drop Wish/heals when HP is already fine."""
+        my = battle.active_pokemon
+        if my is None or not moves:
+            return moves
+        hp = float(my.current_hp_fraction if my.current_hp_fraction is not None else 1.0)
+        recovery = {
+            "wish", "roost", "recover", "softboiled", "slackoff", "healorder",
+            "moonlight", "synthesis", "rest", "strengthsap",
+        }
+        if hp >= 0.70:
+            filtered = [
+                m for m in moves if normalize_token(getattr(m, "id", "")) not in recovery
+            ]
+            if filtered:
+                return filtered
+        if hp >= 0.45:
+            filtered = [
+                m for m in moves if normalize_token(getattr(m, "id", "")) != "wish"
+            ]
+            if filtered:
+                return filtered
+        return moves
+
+    def _filter_available_moves(
+        self,
+        available_moves: List[Move],
+        battle: Optional[AbstractBattle],
+    ) -> List[Move]:
+        moves = super()._filter_available_moves(available_moves, battle)
+        if battle is not None:
+            moves = self._filter_recovery_spam(moves, battle)
+        return moves
+
+    def _advantageous_setup_move(
+        self, move: Move, battle: AbstractBattle
+    ) -> bool:
+        if not self._is_setup_move(move):
+            return False
+        my = battle.active_pokemon
+        enemy = battle.opponent_active_pokemon
+        if my is None or enemy is None:
+            return False
+        hp = float(my.current_hp_fraction if my.current_hp_fraction is not None else 1.0)
+        if hp < 0.55:
+            return False
+        if self._positive_boost_sum(self._active_boosts(battle)) > 0:
+            return False
+        if self._offensive_matchup(my, enemy) < 2.0:
+            return False
+        worst = estimate_enemy_worst_damage(enemy, my)
+        return worst < hp * 0.50
+
+    def _should_block_setup(
+        self,
+        move: Move,
+        *,
+        battle: AbstractBattle,
+        boosts: Dict[str, int],
+        last_token: str,
+        available_moves: Optional[List[Move]] = None,
+    ) -> bool:
+        if self._advantageous_setup_move(move, battle):
+            tag = battle.battle_tag
+            if self._setups_used.get(tag, 0) >= max(2, self.max_setups_per_battle or 2):
+                return True
+            mon_key = self._active_mon_setup_key(battle)
+            per_active = self._setups_used_active.get(tag, {}).get(mon_key, 0)
+            if per_active >= max(1, self.max_setups_per_active or 1):
+                return True
+            return False
+        return super()._should_block_setup(
+            move,
+            battle=battle,
+            boosts=boosts,
+            last_token=last_token,
+            available_moves=available_moves,
         )
+
+    async def _try_advantageous_setup_override(self, battle: AbstractBattle):
+        """Setup when type-advantaged and the foe cannot punish it."""
+        moves = list(battle.available_moves or [])
+        if not moves:
+            return None
+        boosts = self._active_boosts(battle)
+        last_token = self._last_my_move.get(battle.battle_tag) or ""
+        allowed = [
+            m
+            for m in moves
+            if self._is_setup_move(m)
+            and not self._should_block_setup(
+                m,
+                battle=battle,
+                boosts=boosts,
+                last_token=last_token,
+                available_moves=moves,
+            )
+        ]
+        if not allowed:
+            return None
+        best = max(
+            allowed,
+            key=lambda m: (
+                1 if normalize_token(m.id) in ("noretreat", "shellsmash", "victorydance") else 0,
+                float(getattr(m, "base_power", 0) or 0),
+            ),
+        )
+        order = self.create_order(best)
+        self._remember_move(battle, order)
+        return order
 
     def _filter_defensive_switches(
         self, battle: AbstractBattle, switches: List[Pokemon]
@@ -175,6 +321,18 @@ class RbSearchPlayer(RbHybridPlayer):
             )
         ]
 
+    def _worth_engine_switch(self, battle: AbstractBattle, candidate: Pokemon) -> bool:
+        """Defensive improvement or faster guaranteed clean OHKO — else skip engine."""
+        my = battle.active_pokemon
+        enemy = battle.opponent_active_pokemon
+        if my is None or enemy is None:
+            return False
+        if switch_improvement_ok(
+            my, candidate, enemy, min_product_ratio=self.switch_min_improvement
+        ):
+            return True
+        return is_fast_clean_revenge_switch(candidate, enemy)
+
     def _switch_candidates(
         self,
         battle: AbstractBattle,
@@ -183,35 +341,41 @@ class RbSearchPlayer(RbHybridPlayer):
     ) -> List[Pokemon]:
         """Bench mons worth engine-evaluating as switch options this turn.
 
-        Always includes the best *offensive* matchups vs the current enemy
-        (so revenge-killers get scored even when the model wouldn't pick
-        them), plus the defensive switches when the active is in danger.
+        Pruned (default): only defensive improvements and fast clean OHKOs.
         Capped at ``tiebreak_switch_top_k`` to bound engine cost.
         """
         if not switches:
             return []
         enemy = battle.opponent_active_pokemon
         cap = self.tiebreak_switch_top_k
-        picked: List[Pokemon] = []
-        # Defensive switches first when we actually need to pivot out.
-        if defensively_needed:
-            for s in self._filter_defensive_switches(battle, switches):
-                if s not in picked:
-                    picked.append(s)
-        # Then the strongest offensive matchups (type product vs enemy).
+        pool = list(switches)
+        if self.engine_prune_switches:
+            pool = [s for s in switches if self._worth_engine_switch(battle, s)]
+        if not pool:
+            return []
+
+        my = battle.active_pokemon
+        defensive = (
+            self._filter_defensive_switches(battle, pool) if my is not None else []
+        )
+        revenge: List[Pokemon] = []
         if enemy is not None:
-            by_offense = sorted(
-                switches,
-                key=lambda s: self._offensive_matchup(s, enemy),
-                reverse=True,
-            )
-        else:
-            by_offense = list(switches)
-        for s in by_offense:
-            if len(picked) >= cap:
-                break
+            revenge = [s for s in pool if is_fast_clean_revenge_switch(s, enemy)]
+
+        picked: List[Pokemon] = []
+        for s in defensive + revenge:
             if s not in picked:
                 picked.append(s)
+        if not picked:
+            picked = list(pool)
+
+        if enemy is not None:
+            picked.sort(
+                key=lambda s: (
+                    0 if s in defensive else 1,
+                    -self._pivot_matchup_score(s, enemy),
+                ),
+            )
         return picked[:cap]
 
     def _winrate_kwargs(self) -> dict:
@@ -280,44 +444,65 @@ class RbSearchPlayer(RbHybridPlayer):
     # ------------------------------------------------------------------
 
     def _ensure_engine(self) -> bool:
-        """Lazily create the EngineSimulator and EngineTurnEvaluator.
+        """Lazily create engine simulators and evaluators (one bridge per worker).
 
         Returns True on success, False if instantiation failed (in which case
         we fall back to the approximate evaluator).
         """
-        if self._engine_eval is not None:
+        if self._engine_pool is not None:
             return True
         if not self.use_engine:
             return False
         try:
+            from common.engine_eval_pool import EngineEvalPool
             from common.engine_turn_eval import EngineTurnEvaluator
             from common.pkmn_engine_simulator import EngineSimulator
 
             set_dex = self._winrate.builder.set_dex if self._winrate else None
-            self._engine_sim = EngineSimulator(set_dex=set_dex)
             model_evaluator = None
             base_state_fn = None
             if self.engine_use_model and self._winrate is not None:
                 model_evaluator = self._winrate.predict_state
                 base_state_fn = self._state_dict
-            self._engine_eval = EngineTurnEvaluator(
-                self._engine_sim,
-                aggregation=self.engine_aggregation,
-                n_opponent_worlds=self.engine_n_worlds,
-                world_aggregation=self.engine_world_aggregation,
-                model_evaluator=model_evaluator,
-                base_state_fn=base_state_fn,
-                search_depth=self.engine_depth,
-                min_switch_remaining_depth=self.engine_switch_min_depth,
-                depth2_opp_top_k=self.engine_depth2_opp_top_k,
-                depth2_my_top_k=self.engine_depth2_my_top_k,
-                deep_opp_move_cap=self.engine_deep_opp_move_cap,
-                opp_switch_base=self.engine_opp_switch_base,
-                opp_switch_max=self.engine_opp_switch_max,
-                prune_my_move_delta=self.engine_prune_delta,
-                win_cutoff=self.engine_win_cutoff,
-                verbose=self.engine_verbose,
-            )
+            n_workers = self.engine_workers
+            # Verbose logs interleave badly across threads; only on single worker.
+            verbose = self.engine_verbose and n_workers == 1
+            sims: List[Any] = []
+            evaluators: List[Any] = []
+            for _ in range(n_workers):
+                sim = EngineSimulator(set_dex=set_dex)
+                ev = EngineTurnEvaluator(
+                    sim,
+                    aggregation=self.engine_aggregation,
+                    n_opponent_worlds=self.engine_n_worlds,
+                    world_aggregation=self.engine_world_aggregation,
+                    model_evaluator=model_evaluator,
+                    base_state_fn=base_state_fn,
+                    search_depth=self.engine_depth,
+                    min_switch_remaining_depth=self.engine_switch_min_depth,
+                    depth2_opp_top_k=self.engine_depth2_opp_top_k,
+                    depth2_my_top_k=self.engine_depth2_my_top_k,
+                    deep_opp_move_cap=self.engine_deep_opp_move_cap,
+                    opp_switch_base=self.engine_opp_switch_base,
+                    opp_switch_max=self.engine_opp_switch_max,
+                    prune_my_move_delta=self.engine_prune_delta,
+                    win_cutoff=self.engine_win_cutoff,
+                    verbose=verbose,
+                )
+                sims.append(sim)
+                evaluators.append(ev)
+            self._engine_sims = sims
+            self._engine_evaluators = evaluators
+            self._engine_pool = EngineEvalPool(evaluators)
+            self._engine_sim = sims[0]
+            self._engine_eval = evaluators[0]
+            if n_workers > 1 and self.engine_verbose:
+                print(
+                    f"[RbSearchPlayer] engine_workers={n_workers} "
+                    "(verbose désactivé en parallèle)",
+                    file=sys.stderr,
+                    flush=True,
+                )
             return True
         except Exception as exc:
             print(f"[RbSearchPlayer] engine init failed, fallback to model eval: {exc}")
@@ -375,11 +560,14 @@ class RbSearchPlayer(RbHybridPlayer):
             pass
 
     def _engine_close(self) -> None:
-        try:
-            if self._engine_sim is not None:
-                self._engine_sim.close()
-        except Exception:
-            pass
+        for sim in self._engine_sims:
+            try:
+                sim.close()
+            except Exception:
+                pass
+        self._engine_sims = []
+        self._engine_evaluators = []
+        self._engine_pool = None
         self._engine_sim = None
         self._engine_eval = None
 
@@ -422,21 +610,7 @@ class RbSearchPlayer(RbHybridPlayer):
             branches.append(("switch", sp, 0.2))
         return branches
 
-    def _eval_move_win_prob(self, state: Dict[str, object], token: str) -> float:
-        # Engine path: simulate the real turn with @pkmn/sim.
-        if self.use_engine and self._ensure_engine():
-            battle = getattr(self, "_search_battle", None)
-            if battle is not None and self._engine_eval is not None:
-                try:
-                    branches = self._engine_opp_branches(state)
-                    res = self._engine_eval.evaluate_my_move(
-                        battle, my_move=token, opp_branches=branches
-                    )
-                    if not res.setup_failed:
-                        return float(res.win_prob)
-                except Exception as exc:
-                    print(f"[RbSearchPlayer] engine move eval failed: {exc}; fallback")
-        # Fallback: model-based 1-ply on approximate state.
+    def _fallback_move_win_prob(self, state: Dict[str, object], token: str) -> float:
         assert self._winrate is not None
         if self.use_one_ply_turn:
             return self._winrate.predict_after_one_ply_turn(
@@ -444,19 +618,7 @@ class RbSearchPlayer(RbHybridPlayer):
             )
         return self._winrate.predict_state(state_after_move(state, token))
 
-    def _eval_switch_win_prob(self, state: Dict[str, object], species: str) -> float:
-        if self.use_engine and self._ensure_engine():
-            battle = getattr(self, "_search_battle", None)
-            if battle is not None and self._engine_eval is not None:
-                try:
-                    branches = self._engine_opp_branches(state)
-                    res = self._engine_eval.evaluate_my_switch(
-                        battle, my_switch=species, opp_branches=branches
-                    )
-                    if not res.setup_failed:
-                        return float(res.win_prob)
-                except Exception as exc:
-                    print(f"[RbSearchPlayer] engine switch eval failed: {exc}; fallback")
+    def _fallback_switch_win_prob(self, state: Dict[str, object], species: str) -> float:
         assert self._winrate is not None
         if self.use_one_ply_turn:
             return self._winrate.predict_after_my_switch_one_ply(
@@ -465,6 +627,105 @@ class RbSearchPlayer(RbHybridPlayer):
         from random_battle.players.turn_simulation import state_after_my_switch
 
         return self._winrate.predict_state(state_after_my_switch(state, species))
+
+    def _engine_move_wp(
+        self,
+        evaluator: Any,
+        battle: AbstractBattle,
+        state: Dict[str, object],
+        token: str,
+        branches: List[Tuple[str, str, float]],
+    ) -> float:
+        res = evaluator.evaluate_my_move(
+            battle, my_move=token, opp_branches=branches
+        )
+        if res.setup_failed:
+            return self._fallback_move_win_prob(state, token)
+        return float(res.win_prob)
+
+    def _engine_switch_wp(
+        self,
+        evaluator: Any,
+        battle: AbstractBattle,
+        state: Dict[str, object],
+        species: str,
+        branches: List[Tuple[str, str, float]],
+    ) -> float:
+        res = evaluator.evaluate_my_switch(
+            battle, my_switch=species, opp_branches=branches
+        )
+        if res.setup_failed:
+            return self._fallback_switch_win_prob(state, species)
+        return float(res.win_prob)
+
+    def _parallel_engine_move_wps(
+        self,
+        battle: AbstractBattle,
+        state: Dict[str, object],
+        tokens: List[str],
+    ) -> List[float]:
+        branches = self._engine_opp_branches(state)
+        pool = self._engine_pool
+        assert pool is not None
+
+        def eval_one(ev: Any, token: str) -> float:
+            try:
+                return self._engine_move_wp(ev, battle, state, token, branches)
+            except Exception as exc:
+                print(
+                    f"[RbSearchPlayer] engine move eval failed ({token}): {exc}; fallback"
+                )
+                return self._fallback_move_win_prob(state, token)
+
+        return pool.map(eval_one, tokens)
+
+    def _parallel_engine_switch_wps(
+        self,
+        battle: AbstractBattle,
+        state: Dict[str, object],
+        species_list: List[str],
+    ) -> List[float]:
+        branches = self._engine_opp_branches(state)
+        pool = self._engine_pool
+        assert pool is not None
+
+        def eval_one(ev: Any, species: str) -> float:
+            try:
+                return self._engine_switch_wp(ev, battle, state, species, branches)
+            except Exception as exc:
+                print(
+                    f"[RbSearchPlayer] engine switch eval failed ({species}): "
+                    f"{exc}; fallback"
+                )
+                return self._fallback_switch_win_prob(state, species)
+
+        return pool.map(eval_one, species_list)
+
+    def _eval_move_win_prob(self, state: Dict[str, object], token: str) -> float:
+        if self.use_engine and self._ensure_engine():
+            battle = getattr(self, "_search_battle", None)
+            if battle is not None and self._engine_eval is not None:
+                try:
+                    branches = self._engine_opp_branches(state)
+                    return self._engine_move_wp(
+                        self._engine_eval, battle, state, token, branches
+                    )
+                except Exception as exc:
+                    print(f"[RbSearchPlayer] engine move eval failed: {exc}; fallback")
+        return self._fallback_move_win_prob(state, token)
+
+    def _eval_switch_win_prob(self, state: Dict[str, object], species: str) -> float:
+        if self.use_engine and self._ensure_engine():
+            battle = getattr(self, "_search_battle", None)
+            if battle is not None and self._engine_eval is not None:
+                try:
+                    branches = self._engine_opp_branches(state)
+                    return self._engine_switch_wp(
+                        self._engine_eval, battle, state, species, branches
+                    )
+                except Exception as exc:
+                    print(f"[RbSearchPlayer] engine switch eval failed: {exc}; fallback")
+        return self._fallback_switch_win_prob(state, species)
 
     def _compute_switch_scores(
         self,
@@ -515,20 +776,33 @@ class RbSearchPlayer(RbHybridPlayer):
 
         state = self._state_dict(battle)
         score_by_move = {move: s for s, move in scored}
-        ranked: List[tuple[float, float, Move]] = []
+        move_tasks: List[tuple[str, float, Move]] = []
         for move in shortlist:
             if not isinstance(move, Move):
                 continue
             token = normalize_token(move.id)
             if not token:
                 continue
-            ranked.append(
-                (
-                    self._eval_move_win_prob(state, token),
-                    score_by_move.get(move, 0.0),
-                    move,
+            move_tasks.append((token, score_by_move.get(move, 0.0), move))
+
+        ranked: List[tuple[float, float, Move]] = []
+        if move_tasks:
+            if (
+                self.use_engine
+                and self._ensure_engine()
+                and self._engine_pool is not None
+                and getattr(self, "_search_battle", None) is not None
+            ):
+                wps = self._parallel_engine_move_wps(
+                    self._search_battle, state, [t[0] for t in move_tasks]
                 )
-            )
+                ranked = [
+                    (wp, ms, move) for (wp, (_, ms, move)) in zip(wps, move_tasks)
+                ]
+            else:
+                for token, ms, move in move_tasks:
+                    ranked.append((self._eval_move_win_prob(state, token), ms, move))
+
         if not ranked:
             m = shortlist[0] if isinstance(shortlist[0], Move) else None
             return m, -1.0, scored[0][0]
@@ -606,7 +880,7 @@ class RbSearchPlayer(RbHybridPlayer):
 
         st = self._state_dict(battle)
         score_by_mon = {mon: s for s, mon in scored}
-        ranked: List[tuple[float, float, Pokemon]] = []
+        switch_tasks: List[tuple[str, float, Pokemon]] = []
         for item in shortlist:
             mon = item[1] if isinstance(item, tuple) else item
             if not isinstance(mon, Pokemon):
@@ -614,13 +888,26 @@ class RbSearchPlayer(RbHybridPlayer):
             species = species_name(mon)
             if not species:
                 continue
-            ranked.append(
-                (
-                    self._eval_switch_win_prob(st, species),
-                    score_by_mon.get(mon, 0.0),
-                    mon,
+            switch_tasks.append((species, score_by_mon.get(mon, 0.0), mon))
+
+        ranked: List[tuple[float, float, Pokemon]] = []
+        if switch_tasks:
+            if (
+                self.use_engine
+                and self._ensure_engine()
+                and self._engine_pool is not None
+                and getattr(self, "_search_battle", None) is not None
+            ):
+                wps = self._parallel_engine_switch_wps(
+                    self._search_battle, st, [t[0] for t in switch_tasks]
                 )
-            )
+                ranked = [
+                    (wp, ms, mon) for (wp, (_, ms, mon)) in zip(wps, switch_tasks)
+                ]
+            else:
+                for species, ms, mon in switch_tasks:
+                    ranked.append((self._eval_switch_win_prob(st, species), ms, mon))
+
         if not ranked:
             return available_switches[0], -1.0, scored[0][0]
 
@@ -705,6 +992,12 @@ class RbSearchPlayer(RbHybridPlayer):
         else:
             t0 = None
         try:
+            override = await self._try_priority_combat_override(battle)
+            if override is not None:
+                return override
+            override = await self._try_advantageous_setup_override(battle)
+            if override is not None:
+                return override
             override = await self._try_heuristic_override(battle)
             if override is not None:
                 return override

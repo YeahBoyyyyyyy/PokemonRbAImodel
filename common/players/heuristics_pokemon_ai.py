@@ -200,7 +200,7 @@ class HighHeuristicAI(Player):
             return {}
 
         scores = {}
-        moves = battle.available_moves  # ✅ poke-env fournit déjà ceux utilisables
+        moves = battle.available_moves  # poke-env fournit déjà ceux utilisables
         if not moves:
             return {}
 
@@ -379,7 +379,7 @@ class HighHeuristicAI(Player):
         
         damage_max = (((2 * 50 / 5 + 2) * base_power * (base_attack / max(1, base_defense))) / 50) + 2
 
-        # 🔹 Multiplicateurs de base
+        # Multiplicateurs de base
         stab = 1.5 if move.type in (attacker.types or []) else 1.0
         eff = type_effectiveness(move.type, defender.types)
 

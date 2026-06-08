@@ -18,6 +18,7 @@ without claiming numerical accuracy.
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,8 +30,20 @@ if str(_COMMON_DIR) not in sys.path:
 
 from materials import type_effectiveness  # noqa: E402
 
+from defensive_switch import estimate_pokemon_speed  # noqa: E402
+
 # Empirical scaling so that 80 BP * 1x effectiveness * 1.5 STAB ~= 0.6 (60% HP).
 _SCORE_TO_FRAC = 0.005
+
+# Common RB moves that lower the user's stats (fallback when metadata is sparse).
+_SELF_STAT_DROP_MOVES = frozenset(
+    {
+        "closecombat", "superpower", "overheat", "dracometeor", "leafstorm",
+        "psychoboost", "fleurcannon", "hammerarm", "vcreate", "makeitrain",
+        "armorcannon", "headlongrush", "wavecrash",
+        "highjumpkick", "doubleedge", "woodhammer", "bravebird", "flareblitz",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -63,6 +76,161 @@ def _pokemon_types_from_poke(mon: object) -> List[str]:
         if name:
             out.append(name)
     return out
+
+
+def _move_token(move: object) -> str:
+    mid = getattr(move, "id", None) or getattr(move, "name", None) or ""
+    return re.sub(r"[^a-z0-9]", "", str(mid).lower().strip())
+
+
+def move_lowers_own_stats(move: object) -> bool:
+    """True when the move is known to drop the user's stats."""
+    token = _move_token(move)
+    if token in _SELF_STAT_DROP_MOVES:
+        return True
+    self_boost = getattr(move, "self_boost", None) or {}
+    if isinstance(self_boost, dict) and any(int(v) < 0 for v in self_boost.values()):
+        return True
+    self_target = getattr(move, "target", None)
+    target_name = getattr(self_target, "name", self_target)
+    if str(target_name).lower() in ("self", "ally", "allies"):
+        boost = getattr(move, "boosts", None) or {}
+        if isinstance(boost, dict) and any(int(v) < 0 for v in boost.values()):
+            return True
+    return False
+
+
+def move_effective_accuracy(move: object) -> float:
+    """100 = always hits; lower values are percent accuracy."""
+    acc = getattr(move, "accuracy", None)
+    if acc is True:
+        return 100.0
+    if acc is None:
+        attrs = _move_attributes(move)
+        return 100.0 if attrs is not None else 0.0
+    try:
+        return float(acc)
+    except (TypeError, ValueError):
+        return 100.0
+
+
+def is_clean_damaging_move(move: object) -> bool:
+    """Damaging move with full accuracy and no self stat drop."""
+    if _move_attributes(move) is None:
+        return False
+    if move_lowers_own_stats(move):
+        return False
+    return move_effective_accuracy(move) >= 100.0
+
+
+def can_guaranteed_ko_on_hit(
+    move: object,
+    my_mon: object,
+    enemy_mon: object,
+    *,
+    my_tera_type: Optional[str] = None,
+) -> bool:
+    """True if the worst damage roll still KOs on hit."""
+    if enemy_mon is None or my_mon is None:
+        return False
+    est = estimate_my_damage_on_enemy(
+        move, my_mon, enemy_mon, my_tera_type=my_tera_type
+    )
+    if est is None:
+        return False
+    enemy_hp = float(getattr(enemy_mon, "current_hp_fraction", None) or 1.0)
+    return est.min_frac >= enemy_hp
+
+
+def find_clean_guaranteed_ko_move(
+    moves: Iterable[object],
+    my_mon: object,
+    enemy_mon: Optional[object],
+    *,
+    my_tera_type: Optional[str] = None,
+) -> Optional[object]:
+    """Best fully-accurate, no-stat-drop move that guaranteed KOs on hit."""
+    if enemy_mon is None or my_mon is None:
+        return None
+    best_move: Optional[object] = None
+    best_key = (-1.0, -1.0)
+    for move in moves:
+        if not is_clean_damaging_move(move):
+            continue
+        if not can_guaranteed_ko_on_hit(
+            move, my_mon, enemy_mon, my_tera_type=my_tera_type
+        ):
+            continue
+        attrs = _move_attributes(move)
+        if attrs is None:
+            continue
+        mv_type, base_power, _category = attrs
+        my_types = (
+            [_normalize_type_name(my_tera_type)]
+            if my_tera_type
+            else _pokemon_types_from_poke(my_mon)
+        )
+        enemy_types = _pokemon_types_from_poke(enemy_mon)
+        raw = _score_attack(mv_type, base_power, my_types, enemy_types)
+        key = (move_effective_accuracy(move), raw)
+        if key > best_key:
+            best_key = key
+            best_move = move
+    return best_move
+
+
+def _damaging_moves_from_mon(mon: object) -> List[object]:
+    moves = getattr(mon, "moves", None) or {}
+    if isinstance(moves, dict):
+        return [
+            mv
+            for mv in moves.values()
+            if mv is not None and _move_attributes(mv) is not None
+        ]
+    return []
+
+
+def is_fast_clean_revenge_switch(bench: object, enemy_mon: object) -> bool:
+    """Bench mon outspeeds the foe and has a guaranteed clean OHKO on switch-in."""
+    if enemy_mon is None or getattr(bench, "fainted", False):
+        return False
+    if estimate_pokemon_speed(bench) <= estimate_pokemon_speed(enemy_mon):
+        return False
+    moves = _damaging_moves_from_mon(bench)
+    return find_clean_guaranteed_ko_move(moves, bench, enemy_mon) is not None
+
+
+def find_fastest_revenge_killer(
+    switches: Iterable[object],
+    enemy_mon: object,
+    *,
+    active_mon: Optional[object] = None,
+    require_faster_than_active: bool = False,
+) -> Optional[object]:
+    """Bench Pokémon that outspeeds the foe and has a clean guaranteed KO."""
+    if enemy_mon is None:
+        return None
+    enemy_spe = estimate_pokemon_speed(enemy_mon)
+    active_spe = (
+        estimate_pokemon_speed(active_mon) if active_mon is not None else -1
+    )
+    best: Optional[object] = None
+    best_spe = -1
+    for mon in switches:
+        if getattr(mon, "fainted", False):
+            continue
+        spe = estimate_pokemon_speed(mon)
+        if spe <= enemy_spe:
+            continue
+        if require_faster_than_active and active_mon is not None and spe <= active_spe:
+            continue
+        moves = _damaging_moves_from_mon(mon)
+        if find_clean_guaranteed_ko_move(moves, mon, enemy_mon) is None:
+            continue
+        if spe > best_spe:
+            best_spe = spe
+            best = mon
+    return best
 
 
 def _move_attributes(move: object) -> Optional[tuple]:

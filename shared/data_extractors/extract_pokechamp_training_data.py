@@ -830,7 +830,7 @@ def extract_from_pokechamp_dataset(
         Statistics dictionary
     """
     print("="*70)
-    print("🎓 POKÉCHAMP TRAINING DATA EXTRACTION")
+    print("POKECHAMP TRAINING DATA EXTRACTION")
     print("="*70)
     print(f"Format: {gamemode}")
     print(f"Elo range: {min_elo}-{max_elo}")
@@ -839,7 +839,7 @@ def extract_from_pokechamp_dataset(
     print("="*70 + "\n")
     
     # Load dataset in streaming mode
-    print("📦 Loading Pokéchamp dataset (streaming mode)...")
+    print("Loading Pokéchamp dataset (streaming mode)...")
     dataset = load_dataset(
         "milkkarten/pokechamp",
         split="train",
@@ -877,7 +877,7 @@ def extract_from_pokechamp_dataset(
         'chunks_written': 0
     }
     
-    print(f"🎮 Processing battles...")
+    print("Processing battles...")
     
     # Process battles
     for i, battle in enumerate(filtered_dataset):
@@ -919,7 +919,7 @@ def extract_from_pokechamp_dataset(
             
         except Exception as e:
             if i < 10:  # Print first few errors for debugging
-                print(f"❌ Error processing battle {i+1}: {e}")
+                print(f"Error processing battle {i+1}: {e}")
             stats['battles_failed'] += 1
     
     if current_chunk:
@@ -930,7 +930,7 @@ def extract_from_pokechamp_dataset(
         stats['chunks_written'] += 1
 
     print("\n" + "="*70)
-    print("✅ EXTRACTION COMPLETE")
+    print("EXTRACTION COMPLETE")
     print("="*70)
     print(f"Battles processed: {stats['battles_processed']}")
     print(f"Battles failed: {stats['battles_failed']}")

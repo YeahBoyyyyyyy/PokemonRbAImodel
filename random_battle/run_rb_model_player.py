@@ -4,6 +4,8 @@ Run the Random Battle multi-head model on a local Showdown server via poke-env.
 Examples:
   python random_battle/run_rb_model_player.py --mode accept --opponent Natanyelle
   python random_battle/run_rb_model_player.py --mode battle --n_battles 10
+  python random_battle/run_rb_model_player.py --mode ladder --server official \\
+      --username MonBot --password '***' --search --use_engine --duration_minutes 120
 """
 
 from __future__ import annotations
@@ -11,13 +13,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from poke_env import AccountConfiguration
+from poke_env import AccountConfiguration, ShowdownServerConfiguration
 
 from common.players.heuristics_pokemon_ai import HighHeuristicAI, LowHeuristicAI, RandomAI
 from common.project_paths import setup_import_paths
@@ -46,14 +49,36 @@ OPPONENTS = {
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Play gen9randombattle with RbModelPlayer.")
-    parser.add_argument("--mode", choices=("accept", "battle"), default="battle")
+    parser.add_argument(
+        "--mode",
+        choices=("accept", "battle", "ladder"),
+        default="battle",
+        help="battle=vs bot local ; accept=défis ; ladder=queue officielle.",
+    )
+    parser.add_argument(
+        "--server",
+        choices=("local", "official"),
+        default="local",
+        help="local=localhost:8000 ; official=play.pokemonshowdown.com (ladder/accept).",
+    )
     parser.add_argument(
         "--username",
         default="",
-        help="Nom Showdown (vide = nom unique auto, recommandé en local).",
+        help="Nom Showdown (obligatoire sur official ; vide = guest auto en local).",
     )
     parser.add_argument("--password", default=None)
     parser.add_argument("--opponent", default="Natanyelle", help="Human name for accept mode.")
+    parser.add_argument(
+        "--accept_all",
+        action="store_true",
+        help="Mode accept : accepter les défis de n'importe qui.",
+    )
+    parser.add_argument(
+        "--duration_minutes",
+        type=int,
+        default=0,
+        help="Mode ladder : durée max en minutes (0 = utiliser --n_battles).",
+    )
     parser.add_argument("--vs", choices=tuple(OPPONENTS.keys()), default="low")
     parser.add_argument("--n_battles", type=int, default=5)
     parser.add_argument(
@@ -122,6 +147,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Multiplicateur des probas modèle pour les coups setup (si encore légaux).",
     )
     parser.add_argument("--max_concurrent_battles", type=int, default=1)
+    parser.add_argument(
+        "--ping_timeout",
+        type=float,
+        default=None,
+        help=(
+            "Timeout websocket keepalive (s). Défaut auto : 180 sur official/engine, "
+            "sinon 20. Augmenter si déconnexions pendant les longs calculs."
+        ),
+    )
+    parser.add_argument(
+        "--ping_interval",
+        type=float,
+        default=None,
+        help="Intervalle ping websocket (s). Défaut auto : 45 sur official/engine.",
+    )
     parser.add_argument("--format", default=FORMAT_ID, dest="battle_format")
     parser.add_argument(
         "--hybrid",
@@ -283,6 +323,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--engine_workers",
+        type=int,
+        default=1,
+        help=(
+            "Nombre de bridges Node en parallèle pour évaluer les candidats "
+            "moves/switches (un subprocess par worker). 4 est un bon départ."
+        ),
+    )
+    parser.add_argument(
+        "--engine_prune_switches",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Avec --search : n'évalue en engine que les switchs défensifs "
+            "ou plus rapides avec OHKO propre garanti (plus rapide en ladder)."
+        ),
+    )
+    parser.add_argument(
         "--tiebreak_top_k",
         type=int,
         default=5,
@@ -352,7 +410,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def run_ladder_session(player, *, n_battles: int, duration_minutes: int) -> None:
+    if duration_minutes > 0:
+        deadline = time.monotonic() + duration_minutes * 60
+        games = 0
+        while time.monotonic() < deadline:
+            await player.ladder(1)
+            games += 1
+        print(
+            f"Ladder : {games} combats en {duration_minutes} min "
+            f"({player.n_won_battles} victoires)."
+        )
+        return
+    await player.ladder(n_battles)
+    total = max(player.n_finished_battles, 1)
+    print(
+        f"Ladder : {player.n_won_battles}/{n_battles} victoires "
+        f"({player.n_won_battles / total:.1%})."
+    )
+
+
 async def main_async(args: argparse.Namespace) -> None:
+    if args.mode in ("ladder", "accept") and args.server == "official":
+        if not args.username.strip():
+            raise SystemExit(
+                "Sur le serveur officiel, --username (compte enregistré) est requis."
+            )
+        if not args.password:
+            print(
+                "Attention : pas de --password — connexion invité (peut être instable)."
+            )
+
     if args.username.strip():
         account = AccountConfiguration(args.username.strip(), args.password)
         bot_name = account.username
@@ -360,11 +448,33 @@ async def main_async(args: argparse.Namespace) -> None:
         account = AccountConfiguration.generate("RbBot", rand=True)
         bot_name = account.username
 
-    server_configuration = LOCAL_SERVER_CONFIGURATION
+    server_configuration = (
+        ShowdownServerConfiguration
+        if args.server == "official"
+        else LOCAL_SERVER_CONFIGURATION
+    )
+    if args.mode == "ladder" and args.server != "official":
+        print("Mode ladder : bascule automatique sur --server official.")
+        server_configuration = ShowdownServerConfiguration
+    ping_timeout = args.ping_timeout
+    ping_interval = args.ping_interval
+    if args.server == "official" or args.use_engine:
+        if ping_timeout is None:
+            ping_timeout = 180.0
+        if ping_interval is None:
+            ping_interval = 45.0
+    else:
+        if ping_timeout is None:
+            ping_timeout = 20.0
+        if ping_interval is None:
+            ping_interval = 20.0
+
     player_kwargs = dict(
         account_configuration=account,
         server_configuration=server_configuration,
         max_concurrent_battles=args.max_concurrent_battles,
+        ping_timeout=ping_timeout,
+        ping_interval=ping_interval,
         model_path=Path(args.model),
         vocab_path=Path(args.vocab),
         set_dex_path=Path(args.set_dex),
@@ -393,6 +503,11 @@ async def main_async(args: argparse.Namespace) -> None:
         use_heuristic_overrides=args.hybrid,
     )
     if args.search:
+        # Defaults block all setups (0); search mode allows a few when safe.
+        if args.max_setups_per_battle == 0:
+            player_kwargs["max_setups_per_battle"] = 2
+        if args.max_setups_per_active == 0:
+            player_kwargs["max_setups_per_active"] = 1
         player = RbSearchPlayer(
             winrate_model_path=Path(args.winrate_model),
             use_engine=args.use_engine,
@@ -409,6 +524,8 @@ async def main_async(args: argparse.Namespace) -> None:
             engine_prune_delta=args.engine_prune_delta,
             engine_win_cutoff=args.engine_win_cutoff,
             engine_verbose=args.engine_verbose,
+            engine_workers=args.engine_workers,
+            engine_prune_switches=args.engine_prune_switches,
             offensive_switch_margin=args.offensive_switch_margin,
             tiebreak_top_k=args.tiebreak_top_k,
             tiebreak_move_min_k=args.tiebreak_move_min_k,
@@ -428,6 +545,8 @@ async def main_async(args: argparse.Namespace) -> None:
                 mode_label += f" x{args.engine_n_worlds} worlds"
             if args.engine_depth > 1:
                 mode_label += f" {args.engine_depth}-ply (élagué)"
+            if args.engine_workers > 1:
+                mode_label += f" x{args.engine_workers} workers"
             if not args.engine_use_model:
                 mode_label += " [heuristic scorer]"
     elif args.hybrid:
@@ -438,19 +557,64 @@ async def main_async(args: argparse.Namespace) -> None:
         mode_label = "modèle seul"
 
     if args.mode == "accept":
+        accept_from = None if args.accept_all else args.opponent
+        ws = server_configuration.websocket_url
         print(
-            f"Connexion au serveur local ({LOCAL_SERVER_CONFIGURATION.websocket_url})...\n"
+            f"Connexion ({ws})...\n"
             f"Bot : {bot_name} [{mode_label}] | format : {args.battle_format}\n"
-            f"Defis acceptes de : {args.opponent!r} (max {args.n_challenges})\n"
-            "---\n"
-            f"1) Ouvre http://localhost:8000 dans le navigateur\n"
-            f"2) Connecte-toi avec le pseudo « {args.opponent} » (exact)\n"
-            f"3) Defie : /challenge {bot_name}, gen9randombattle\n"
-            f"   (ou menu Combat -> Defier -> {bot_name} -> Random Battle)\n"
-            "---"
+            f"Défis acceptés de : "
+            f"{'tout le monde' if accept_from is None else accept_from!r} "
+            f"(max {args.n_challenges})\n"
         )
-        await player.accept_challenges(args.opponent, n_challenges=args.n_challenges)
-        print(f"Combats terminés : {player.n_finished_battles}, victoires : {player.n_won_battles}")
+        if args.server == "local":
+            print(
+                "---\n"
+                f"1) Ouvre http://localhost:8000\n"
+                f"2) Défie : /challenge {bot_name}, {args.battle_format}\n"
+                "---"
+            )
+        else:
+            only = (
+                "n'importe qui"
+                if accept_from is None
+                else f"le joueur « {accept_from} » uniquement"
+            )
+            print(
+                "---\n"
+                "1) Ouvre https://play.pokemonshowdown.com et connecte-toi\n"
+                f"2) Dans le chat : /challenge {bot_name}, {args.battle_format}\n"
+                f"   (défis acceptés de : {only})\n"
+                f"3) Le bot doit rester lancé dans ce terminal\n"
+                f"   (websocket ping_timeout={ping_timeout}s)\n"
+                "---"
+            )
+        if args.use_engine and args.max_concurrent_battles > 1:
+            print("Accept + engine : max_concurrent_battles forcé à 1.")
+            player.max_concurrent_battles = 1
+        await player.accept_challenges(accept_from, n_challenges=args.n_challenges)
+        print(
+            f"Combats terminés : {player.n_finished_battles}, "
+            f"victoires : {player.n_won_battles}"
+        )
+        return
+
+    if args.mode == "ladder":
+        if args.use_engine and args.max_concurrent_battles > 1:
+            print("Ladder + engine : max_concurrent_battles forcé à 1.")
+            player.max_concurrent_battles = 1
+        print(
+            f"Ladder {args.battle_format} — {bot_name} [{mode_label}]\n"
+            f"Serveur : {server_configuration.websocket_url}"
+        )
+        if args.duration_minutes > 0:
+            print(f"Durée : {args.duration_minutes} min")
+        else:
+            print(f"Combats : {args.n_battles}")
+        await run_ladder_session(
+            player,
+            n_battles=args.n_battles,
+            duration_minutes=args.duration_minutes,
+        )
         return
 
     opponent_cls = OPPONENTS[args.vs]
