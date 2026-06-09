@@ -269,6 +269,17 @@ class RbModelPlayer(Player):
     def _positive_boost_sum(self, boosts: Dict[str, int]) -> int:
         return sum(v for v in boosts.values() if v > 0)
 
+    def _switch_boost_margin_penalty(self, battle: AbstractBattle) -> float:
+        """Extra bar for switching when active has setup boosts (lost on pivot)."""
+        pos = self._positive_boost_sum(self._active_boosts(battle))
+        if pos <= 0:
+            return 0.0
+        return min(0.22, 0.04 * float(pos))
+
+    def _discourage_voluntary_switch(self, battle: AbstractBattle) -> bool:
+        """True when boosts make a voluntary pivot usually wasteful."""
+        return self._positive_boost_sum(self._active_boosts(battle)) >= 1
+
     def _pokemon_types(self, mon) -> List[object]:
         if mon is None:
             return []
@@ -804,7 +815,9 @@ class RbModelPlayer(Player):
         switch_probs = preds["switch_slot"][0]
         state = self._state_dict(battle)
 
-        prefer_move = action_prob >= self.action_prob_threshold
+        prefer_move = action_prob >= (
+            self.action_prob_threshold + self._switch_boost_margin_penalty(battle)
+        )
 
         if prefer_move and available_moves:
             move = self._pick_move(move_probs, available_moves, battle=battle)

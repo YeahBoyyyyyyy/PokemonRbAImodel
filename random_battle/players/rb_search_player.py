@@ -1217,6 +1217,7 @@ class RbSearchPlayer(RbHybridPlayer):
             if defensively_needed
             else self.offensive_switch_margin
         )
+        margin += self._switch_boost_margin_penalty(battle)
 
         if (
             best_move is not None

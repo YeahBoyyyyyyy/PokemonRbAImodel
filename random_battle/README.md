@@ -118,7 +118,26 @@ Sur le client Showdown local (`http://localhost:8000`), défie **RbModelBot** en
 ## Benchmark / analyse post-mortem
 
 ```powershell
-# Bench win-rate (ex. 200 combats vs LowHeuristicAI)
+# Bench vs RandomAI + LowHeuristicAI (100 chacun), 3-ply / switch 2-ply
+python random_battle/benchmark.py run `
+  --n_battles 100 --opponents random low `
+  --search --no-hybrid --use_engine `
+  --engine_depth 3 --engine_switch_min_depth 2 `
+  --engine_n_worlds 1 --prune_delta 0.13 `
+  --engine_workers 4 --engine_prune_switches `
+  --label engine3ply
+
+# Comparer les 2 derniers runs
+python random_battle/benchmark.py compare --latest 2
+
+# Lister les runs sauvegardés
+python random_battle/benchmark.py list
+
+# Courbe Elo ladder (nécessite --track_elo en ladder official)
+python random_battle/plot_ladder_elo.py --username MBTIPE
+python random_battle/plot_ladder_elo.py --input random_battle/artifacts/sessions/MBTIPE_elo.jsonl --open
+
+# Bench manuel (une seule série)
 python random_battle/run_rb_model_player.py --mode battle --vs low --n_battles 200 --search --use_engine --engine_n_worlds 5
 
 # Analyser un log de décisions JSONL

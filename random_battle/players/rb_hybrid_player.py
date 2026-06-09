@@ -267,7 +267,11 @@ class RbHybridPlayer(RbModelPlayer):
             if eiscue is not None:
                 return self.create_order(eiscue)
 
-        if enemy_stat_drops_severe(my) and battle.available_moves:
+        if (
+            enemy_stat_drops_severe(my)
+            and battle.available_moves
+            and not self._discourage_voluntary_switch(battle)
+        ):
             from common.defensive_switch import pick_best_defensive_switch
 
             pivot = pick_best_defensive_switch(switches, my, enemy)
@@ -349,8 +353,10 @@ class RbHybridPlayer(RbModelPlayer):
             return None
 
         # 3) Voluntary pivot to a resist (e.g. Torkoal → Vaporeon vs Hydro Pump).
-        if my is not None and has_resist_switch_option(
-            my, enemy, available_switches
+        if (
+            my is not None
+            and not self._discourage_voluntary_switch(battle)
+            and has_resist_switch_option(my, enemy, available_switches)
         ):
             pivot = pick_best_defensive_switch(available_switches, my, enemy)
             if pivot is not None:
@@ -382,8 +388,12 @@ class RbHybridPlayer(RbModelPlayer):
         ):
             return None
 
+        boost_pos = self._positive_boost_sum(self._active_boosts(battle))
         taken = self._defensive_matchup(my, enemy)
-        if taken < self.switch_bad_matchup_ratio and random.random() > self.switch_chance:
+        bad_ratio = self.switch_bad_matchup_ratio
+        if boost_pos > 0:
+            bad_ratio += 1.5 * float(boost_pos)
+        if taken < bad_ratio and random.random() > self.switch_chance:
             return None
 
         target = self._heuristic_best_switch(available_switches, enemy, active=my)
